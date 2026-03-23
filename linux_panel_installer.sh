@@ -21,6 +21,20 @@ DOCKER_DOMAINS="docker.io registry-1.docker.io auth.docker.io production.cloudfl
 DOCKER_REGISTRY_DOMAINS="registry-1.docker.io index.docker.io auth.docker.io"
 DNS_TEST_URL="https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/oh-my-zsh.sh"
 
+# 消息推送配置
+PUSH_CONFIG_FILE="/etc/linux_panel_push_config.json"
+PUSH_ENABLED=false
+PUSH_TYPE=""
+PUSH_DINGTALK_WEBHOOK=""
+PUSH_DINGTALK_SECRET=""
+PUSH_PLUSPUSH_TOKEN=""
+PUSH_WEOA_WEBHOOK=""
+PUSH_WEOA_KEY=""
+PUSH_CUSTOM_WEBHOOK=""
+PUSH_CUSTOM_METHOD="POST"
+PUSH_CUSTOM_HEADERS=""
+PUSH_CUSTOM_BODY=""
+
 # 检查是否以root用户运行
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -568,6 +582,34 @@ install_docker() {
             echo -e "${GREEN}Docker 测试成功！${NC}"
         else
             echo -e "${YELLOW}Docker 测试失败，但Docker已安装${NC}"
+            
+            # 如果测试失败，建议进行DNS检测与修复
+            echo ""
+            echo -e "${CYAN}Docker测试失败，可能是DNS污染问题${NC}"
+            echo -e "${YELLOW}建议进行Docker镜像源DNS检测与修复${NC}"
+            echo ""
+            
+            read -p "是否立即进行DNS检测与修复？(y/n, 默认y): " fix_dns
+            fix_dns=${fix_dns:-y}
+            
+            if [[ $fix_dns =~ ^[Yy]$ ]]; then
+                echo ""
+                fix_docker_dns_integrated
+            fi
+        fi
+        
+        # 安装完成后，询问是否进行DNS检测与修复
+        echo ""
+        echo -e "${CYAN}Docker安装完成，现在可以进行DNS检测与修复${NC}"
+        echo -e "${YELLOW}这可以解决DNS污染导致的镜像拉取问题${NC}"
+        echo ""
+        
+        read -p "是否进行Docker镜像源DNS检测与修复？(y/n, 默认y): " do_dns_fix
+        do_dns_fix=${do_dns_fix:-y}
+        
+        if [[ $do_dns_fix =~ ^[Yy]$ ]]; then
+            echo ""
+            fix_docker_dns_integrated
         fi
         
         # 进入Docker菜单
@@ -3560,6 +3602,965 @@ view_backup_history() {
     esac
 }
 
+# DNS污染检测功能（解析域名对应的10个IP，选择最快的，更新hosts配置）
+dns_pollution_detection() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          DNS污染检测与优化${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}功能说明:${NC}"
+    echo -e "1. 检测指定域名的DNS解析情况"
+    echo -e "2. 获取域名的多个IP地址（最多10个）"
+    echo -e "3. 测试每个IP的响应速度和连通性"
+    echo -e "4. 选择最快的IP地址"
+    echo -e "5. 备份原有hosts文件"
+    echo -e "6. 更新hosts配置，只修改该域名相关条目"
+    echo ""
+    
+    read -p "请输入要检测的域名（如：github.com）: " domain
+    if [ -z "$domain" ]; then
+        echo -e "${RED}域名不能为空${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo ""
+    echo -e "${CYAN}正在检测域名: ${YELLOW}$domain${NC}${CYAN} 的DNS解析...${NC}"
+    echo ""
+    
+    # 从多个DNS服务器获取IP地址
+    local dns_servers=("8.8.8.8" "1.1.1.1" "9.9.9.9" "208.67.222.222" "8.8.4.4")
+    local ip_list=()
+    
+    echo -e "${CYAN}从多个DNS服务器获取IP地址...${NC}"
+    echo ""
+    
+    for dns in "${dns_servers[@]}"; do
+        echo -e "查询DNS服务器: ${YELLOW}$dns${NC}"
+        local ips=$(dig +short $domain @$dns 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        
+        if [ -n "$ips" ]; then
+            while IFS= read -r ip; do
+                if [[ ! " ${ip_list[@]} " =~ " ${ip} " ]]; then
+                    ip_list+=("$ip")
+                    echo -e "  ${GREEN}获取到IP: $ip${NC}"
+                fi
+            done <<< "$ips"
+        else
+            echo -e "  ${YELLOW}未获取到IP${NC}"
+        fi
+    done
+    
+    # 如果获取的IP太少，尝试从其他来源获取
+    if [ ${#ip_list[@]} -lt 3 ]; then
+        echo ""
+        echo -e "${YELLOW}获取到的IP较少，尝试其他来源...${NC}"
+        
+        # 尝试从在线服务获取
+        local online_ips=$(curl -s "https://ipaddress.com/website/$domain" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | head -10)
+        
+        for ip in $online_ips; do
+            if [[ ! " ${ip_list[@]} " =~ " ${ip} " ]]; then
+                ip_list+=("$ip")
+                echo -e "  ${GREEN}从在线服务获取到IP: $ip${NC}"
+            fi
+        done
+    fi
+    
+    if [ ${#ip_list[@]} -eq 0 ]; then
+        echo ""
+        echo -e "${RED}无法获取到任何IP地址，请检查网络或域名是否正确${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo ""
+    echo -e "${GREEN}共获取到 ${#ip_list[@]} 个IP地址:${NC}"
+    printf "  %s\n" "${ip_list[@]}"
+    echo ""
+    
+    # 测试每个IP的速度
+    echo -e "${CYAN}开始测试IP响应速度...${NC}"
+    echo ""
+    
+    local ip_scores=()
+    local fastest_ip=""
+    local fastest_time=99999
+    
+    for ip in "${ip_list[@]}"; do
+        echo -e "测试IP: ${YELLOW}$ip${NC}"
+        
+        # 使用ping测试延迟
+        local ping_result=$(ping -c 3 -W 2 "$ip" 2>&1 | grep 'min/avg/max/mdev' | awk -F '/' '{print $5}')
+        
+        if [ -n "$ping_result" ]; then
+            local avg_time=$(ping -c 3 -W 2 "$ip" 2>&1 | grep 'min/avg/max/mdev' | awk -F '/' '{print $5}')
+            echo -e "  ${GREEN}平均延迟: ${avg_time}ms${NC}"
+            
+            # 计算分数（延迟越低分数越高）
+            local score=$(echo "1000 / ($avg_time + 1)" | bc 2>/dev/null || echo 100)
+            
+            # 记录分数
+            ip_scores+=("$ip:$score")
+            
+            # 记录最快IP
+            if (( $(echo "$avg_time < $fastest_time" | bc -l 2>/dev/null || echo 0) )); then
+                fastest_time=$avg_time
+                fastest_ip=$ip
+            fi
+        else
+            echo -e "  ${RED}无法连接${NC}"
+            ip_scores+=("$ip:0")
+        fi
+        
+        # 添加短暂延迟，避免过快请求
+        sleep 0.5
+    done
+    
+    echo ""
+    
+    if [ -z "$fastest_ip" ]; then
+        echo -e "${RED}所有IP都无法连接，无法进行优化${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo -e "${GREEN}最快IP: ${YELLOW}$fastest_ip${GREEN}，延迟: ${fastest_time}ms${NC}"
+    echo ""
+    
+    # 备份原有hosts文件
+    local backup_file="/etc/hosts.backup_$(date +%Y%m%d_%H%M%S)"
+    echo -e "${CYAN}备份原有hosts文件到: ${YELLOW}$backup_file${NC}"
+    cp /etc/hosts "$backup_file"
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}备份成功${NC}"
+    else
+        echo -e "${RED}备份失败，请检查权限${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo ""
+    
+    # 更新hosts文件
+    echo -e "${CYAN}更新hosts文件...${NC}"
+    
+    # 先移除该域名的旧条目
+    local temp_file="/tmp/hosts.tmp"
+    cp /etc/hosts "$temp_file"
+    
+    # 从临时文件中移除该域名的所有条目
+    sed -i "/$domain/d" "$temp_file"
+    
+    # 添加新的最快IP条目
+    echo "# DNS优化 - 添加于 $(date)" >> "$temp_file"
+    echo -e "${YELLOW}$fastest_ip${NC} ${CYAN}$domain${NC}" | sed 's/\\033\[[0-9;]*m//g' >> "$temp_file"
+    
+    # 如果还有其他相关子域名也添加
+    local subdomains=("www.$domain" "raw.$domain" "api.$domain")
+    for sub in "${subdomains[@]}"; do
+        echo "$fastest_ip $sub" >> "$temp_file"
+    done
+    
+    # 替换原hosts文件
+    mv "$temp_file" /etc/hosts
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}hosts文件更新成功${NC}"
+    else
+        echo -e "${RED}更新失败，请检查权限${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo ""
+    
+    # 刷新DNS缓存
+    echo -e "${CYAN}刷新DNS缓存...${NC}"
+    
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            systemctl restart systemd-resolved 2>/dev/null
+            ;;
+        "ubuntu"|"debian")
+            systemctl restart systemd-resolved 2>/dev/null
+            ;;
+    esac
+    
+    # 通用刷新命令
+    if command -v nscd &> /dev/null; then
+        nscd -i hosts
+    fi
+    
+    if command -v dscacheutil &> /dev/null; then
+        dscacheutil -flushcache
+    fi
+    
+    echo -e "${GREEN}DNS缓存刷新完成${NC}"
+    echo ""
+    
+    # 验证更新
+    echo -e "${CYAN}验证DNS更新...${NC}"
+    local resolved_ip=$(dig +short $domain @8.8.8.8 2>/dev/null | head -1)
+    
+    if [ "$resolved_ip" = "$fastest_ip" ]; then
+        echo -e "${GREEN}✓ DNS更新验证成功${NC}"
+        echo -e "  域名: $domain"
+        echo -e "  当前解析IP: $resolved_ip"
+        echo -e "  预期IP: $fastest_ip"
+    else
+        echo -e "${YELLOW}⚠ DNS更新可能未生效${NC}"
+        echo -e "  当前解析IP: $resolved_ip"
+        echo -e "  预期IP: $fastest_ip"
+        echo -e "  可能需要重启网络服务或等待DNS缓存过期"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}操作完成！${NC}"
+    echo -e "备份文件位置: $backup_file"
+    echo -e "如需恢复，请执行: cp \"$backup_file\" /etc/hosts"
+    echo ""
+    
+    read -p "按回车键返回主菜单..."
+}
+
+# Docker镜像源DNS检测与修复（集成版）
+fix_docker_dns_integrated() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}      Docker镜像源DNS检测与修复（集成版）${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}正在检测Docker镜像源域名DNS污染情况...${NC}"
+    echo ""
+    
+    # Docker相关域名
+    local docker_domains=("docker.io" "registry-1.docker.io" "auth.docker.io" "production.cloudflare.docker.com")
+    local dns_ok=true
+    
+    for domain in "${docker_domains[@]}"; do
+        echo -e "检测域名: ${YELLOW}$domain${NC}"
+        
+        # 尝试解析域名
+        local ip_result
+        ip_result=$(dig +short $domain @8.8.8.8 2>/dev/null | head -1)
+        
+        if [ -z "$ip_result" ]; then
+            echo -e "  ${RED}✗ DNS解析失败${NC}"
+            dns_ok=false
+        elif [[ $ip_result =~ ^(127\.|0\.|169\.254|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) ]]; then
+            echo -e "  ${RED}✗ 检测到污染IP: $ip_result${NC}"
+            dns_ok=false
+        else
+            echo -e "  ${GREEN}✓ 解析正常: $ip_result${NC}"
+        fi
+    done
+    
+    echo ""
+    
+    # 如果DNS解析正常，测试实际可访问性
+    if $dns_ok; then
+        echo -e "${CYAN}测试Docker镜像源实际可访问性...${NC}"
+        echo ""
+        
+        local test_url="https://registry-1.docker.io/v2/"
+        echo -e "测试连接: ${YELLOW}$test_url${NC}"
+        
+        # 测试HTTP连接
+        local http_test=$(timeout 10 curl -s -I --connect-timeout 5 "$test_url" 2>&1 | head -1)
+        
+        if [[ "$http_test" == *"401"* ]] || [[ "$http_test" == *"200"* ]] || [[ "$http_test" == *"302"* ]]; then
+            echo -e "  ${GREEN}✓ 可访问性正常: $http_test${NC}"
+            echo ""
+            echo -e "${GREEN}Docker镜像源访问正常，无需修复${NC}"
+            read -p "按回车键返回..."
+            return
+        fi
+    fi
+    
+    echo -e "${YELLOW}检测到DNS污染或访问问题，开始修复...${NC}"
+    echo ""
+    
+    # 从多个来源获取最新的Docker Hub IP地址
+    echo -e "${CYAN}尝试从多个来源获取Docker Hub IP地址...${NC}"
+    echo ""
+    
+    local docker_ips=()
+    
+    # 尝试从ipaddress.com获取
+    echo -e "1. 从ipaddress.com获取Docker Hub IP..."
+    local ip1=$(curl -s "https://ipaddress.com/website/docker.io" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -5 2>/dev/null)
+    
+    if [ -n "$ip1" ]; then
+        docker_ips+=("$ip1")
+        echo -e "   ${GREEN}获取到IP: $ip1${NC}"
+    else
+        echo -e "   ${RED}获取失败${NC}"
+    fi
+    
+    # 常见Docker Hub IP地址（备用）
+    local common_ips=("34.233.102.125" "35.172.0.2" "52.87.111.37" "54.165.159.111" "54.237.174.207")
+    
+    echo ""
+    echo -e "2. 使用常见Docker Hub IP地址..."
+    for ip in "${common_ips[@]}"; do
+        docker_ips+=("$ip")
+        echo -e "   ${YELLOW}添加备用IP: $ip${NC}"
+    done
+    
+    if [ ${#docker_ips[@]} -eq 0 ]; then
+        echo -e "${RED}无法获取到任何IP地址，请检查网络连接${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo ""
+    echo -e "${GREEN}共获取到 ${#docker_ips[@]} 个IP地址${NC}"
+    echo ""
+    
+    # 测试每个IP的速度和可用性
+    echo -e "${CYAN}测试IP地址的连通性和速度...${NC}"
+    echo ""
+    
+    local best_ip=""
+    local best_score=0
+    
+    for ip in "${docker_ips[@]}"; do
+        echo -e "测试IP: ${YELLOW}$ip${NC}"
+        
+        # ping测试
+        local ping_result=$(ping -c 3 -W 2 "$ip" 2>&1 | grep 'min/avg/max/mdev')
+        local ping_score=0
+        
+        if [ -n "$ping_result" ]; then
+            local avg_time=$(echo "$ping_result" | awk -F '/' '{print $5}')
+            echo -e "  ${GREEN}✓ ping延迟: ${avg_time}ms${NC}"
+            ping_score=$((100 - $(echo "$avg_time" | awk '{printf "%d", $1}') / 2))
+            
+            if [ $ping_score -lt 0 ]; then
+                ping_score=0
+            fi
+        else
+            echo -e "  ${RED}✗ ping测试失败${NC}"
+        fi
+        
+        # HTTP测试
+        local http_test=$(timeout 5 curl -s -I "http://$ip" 2>&1 | head -1)
+        local http_score=0
+        
+        if [[ "$http_test" == *"200"* ]] || [[ "$http_test" == *"301"* ]] || [[ "$http_test" == *"302"* ]]; then
+            echo -e "  ${GREEN}✓ HTTP访问正常${NC}"
+            http_score=50
+        else
+            echo -e "  ${YELLOW}⚠ HTTP访问异常: ${http_test:0:50}...${NC}"
+        fi
+        
+        # 计算总分
+        local total_score=$((ping_score + http_score))
+        echo -e "  综合得分: ${YELLOW}$total_score/150${NC}"
+        
+        if [ $total_score -gt $best_score ]; then
+            best_score=$total_score
+            best_ip=$ip
+        fi
+        
+        echo ""
+        sleep 0.5
+    done
+    
+    if [ -z "$best_ip" ]; then
+        echo -e "${RED}所有IP地址都无法正常连接${NC}"
+        echo -e "${YELLOW}建议:${NC}"
+        echo -e "1. 检查网络连接"
+        echo -e "2. 配置Docker国内镜像源"
+        echo -e "3. 尝试使用代理"
+        echo -e "4. 等待一段时间后重试"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo -e "${GREEN}找到最佳IP地址: ${YELLOW}$best_ip${GREEN} (得分: ${best_score}/150)${NC}"
+    echo ""
+    
+    # 备份当前hosts文件
+    local backup_file="/etc/hosts.backup.docker_$(date +%Y%m%d_%H%M%S)"
+    echo -e "${CYAN}备份当前hosts文件到: ${YELLOW}$backup_file${NC}"
+    cp /etc/hosts "$backup_file"
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}备份失败，请检查权限${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo -e "${GREEN}备份成功${NC}"
+    echo ""
+    
+    # 更新hosts文件
+    echo -e "${CYAN}更新hosts文件...${NC}"
+    
+    # 创建临时文件
+    local temp_file="/tmp/hosts.docker.tmp"
+    cp /etc/hosts "$temp_file"
+    
+    # 移除旧的Docker相关条目
+    for domain in "${docker_domains[@]}"; do
+        sed -i "/$domain/d" "$temp_file"
+    done
+    
+    # 添加新的IP地址
+    echo "" >> "$temp_file"
+    echo "# Docker DNS优化 - 添加于 $(date)" >> "$temp_file"
+    for domain in "${docker_domains[@]}"; do
+        echo "$best_ip $domain" >> "$temp_file"
+    done
+    
+    # 替换原hosts文件
+    mv "$temp_file" /etc/hosts
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}更新失败，请检查权限${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo -e "${GREEN}hosts文件更新成功${NC}"
+    echo ""
+    
+    # 刷新DNS缓存
+    echo -e "${CYAN}刷新DNS缓存...${NC}"
+    
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            systemctl restart systemd-resolved 2>/dev/null
+            ;;
+        "ubuntu"|"debian")
+            systemctl restart systemd-resolved 2>/dev/null
+            ;;
+    esac
+    
+    # 通用刷新命令
+    if command -v nscd &> /dev/null; then
+        nscd -i hosts
+    fi
+    
+    echo -e "${GREEN}DNS缓存刷新完成${NC}"
+    echo ""
+    
+    # 重启Docker服务
+    echo -e "${CYAN}重启Docker服务以使更改生效...${NC}"
+    systemctl restart docker 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Docker服务重启成功${NC}"
+    else
+        echo -e "${YELLOW}Docker服务重启失败或未运行${NC}"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}Docker镜像源DNS修复完成！${NC}"
+    echo ""
+    echo -e "${CYAN}建议:${NC}"
+    echo -e "1. 如果Docker Hub访问仍然有问题，建议配置Docker国内镜像源"
+    echo -e "2. 可以运行脚本中的Docker安装功能来配置镜像源"
+    echo -e "3. 原始hosts文件已备份: $backup_file"
+    echo -e "4. Docker Hub IP地址可能会变化，建议定期运行此功能更新"
+    
+    echo ""
+    read -p "按回车键返回..."
+}
+
+# 加载推送配置
+load_push_config() {
+    if [ -f "$PUSH_CONFIG_FILE" ]; then
+        # 从配置文件加载配置
+        PUSH_ENABLED=$(grep '"enabled":' "$PUSH_CONFIG_FILE" | grep -o 'true\|false')
+        PUSH_TYPE=$(grep '"type":' "$PUSH_CONFIG_FILE" | sed 's/.*"type": "\([^"]*\).*/\1/')
+        
+        case "$PUSH_TYPE" in
+            "dingtalk")
+                PUSH_DINGTALK_WEBHOOK=$(grep '"webhook":' "$PUSH_CONFIG_FILE" | sed 's/.*"webhook": "\([^"]*\).*/\1/')
+                PUSH_DINGTALK_SECRET=$(grep '"secret":' "$PUSH_CONFIG_FILE" | sed 's/.*"secret": "\([^"]*\).*/\1/')
+                ;;
+            "pluspush")
+                PUSH_PLUSPUSH_TOKEN=$(grep '"token":' "$PUSH_CONFIG_FILE" | sed 's/.*"token": "\([^"]*\).*/\1/')
+                ;;
+            "weoa")
+                PUSH_WEOA_WEBHOOK=$(grep '"webhook":' "$PUSH_CONFIG_FILE" | sed 's/.*"webhook": "\([^"]*\).*/\1/')
+                PUSH_WEOA_KEY=$(grep '"key":' "$PUSH_CONFIG_FILE" | sed 's/.*"key": "\([^"]*\).*/\1/')
+                ;;
+            "custom")
+                PUSH_CUSTOM_WEBHOOK=$(grep '"webhook":' "$PUSH_CONFIG_FILE" | sed 's/.*"webhook": "\([^"]*\).*/\1/')
+                PUSH_CUSTOM_METHOD=$(grep '"method":' "$PUSH_CONFIG_FILE" | sed 's/.*"method": "\([^"]*\).*/\1/')
+                PUSH_CUSTOM_HEADERS=$(grep '"headers":' "$PUSH_CONFIG_FILE" | sed 's/.*"headers": "\([^"]*\).*/\1/')
+                PUSH_CUSTOM_BODY=$(grep '"body":' "$PUSH_CONFIG_FILE" | sed 's/.*"body": "\([^"]*\).*/\1/')
+                ;;
+        esac
+        
+        echo -e "${GREEN}推送配置已加载${NC}"
+    else
+        echo -e "${YELLOW}推送配置文件不存在，使用默认配置${NC}"
+        PUSH_ENABLED=false
+    fi
+}
+
+# 保存推送配置
+save_push_config() {
+    local config_content="{
+  \"enabled\": $PUSH_ENABLED,
+  \"type\": \"$PUSH_TYPE\""
+    
+    case "$PUSH_TYPE" in
+        "dingtalk")
+            config_content="$config_content,
+  \"webhook\": \"$PUSH_DINGTALK_WEBHOOK\",
+  \"secret\": \"$PUSH_DINGTALK_SECRET\""
+            ;;
+        "pluspush")
+            config_content="$config_content,
+  \"token\": \"$PUSH_PLUSPUSH_TOKEN\""
+            ;;
+        "weoa")
+            config_content="$config_content,
+  \"webhook\": \"$PUSH_WEOA_WEBHOOK\",
+  \"key\": \"$PUSH_WEOA_KEY\""
+            ;;
+        "custom")
+            config_content="$config_content,
+  \"webhook\": \"$PUSH_CUSTOM_WEBHOOK\",
+  \"method\": \"$PUSH_CUSTOM_METHOD\",
+  \"headers\": \"$PUSH_CUSTOM_HEADERS\",
+  \"body\": \"$PUSH_CUSTOM_BODY\""
+            ;;
+    esac
+    
+    config_content="$config_content
+}"
+    
+    echo "$config_content" > "$PUSH_CONFIG_FILE"
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}推送配置已保存到: $PUSH_CONFIG_FILE${NC}"
+    else
+        echo -e "${RED}保存推送配置失败，请检查权限${NC}"
+    fi
+}
+
+# 发送钉钉消息
+send_dingtalk_message() {
+    local message="$1"
+    local title="$2"
+    
+    if [ -z "$PUSH_DINGTALK_WEBHOOK" ]; then
+        echo -e "${RED}钉钉推送未配置，无法发送消息${NC}"
+        return 1
+    fi
+    
+    # 获取当前时间戳
+    local timestamp=$(date +%s)
+    
+    # 如果有secret，计算签名
+    local sign=""
+    if [ -n "$PUSH_DINGTALK_SECRET" ]; then
+        local string_to_sign="${timestamp}\n${PUSH_DINGTALK_SECRET}"
+        sign=$(echo -n "$string_to_sign" | openssl sha256 -hmac "$PUSH_DINGTALK_SECRET" -binary | base64)
+        sign=$(echo "$sign" | tr -d '\n')
+    fi
+    
+    # 构造请求URL
+    local url="$PUSH_DINGTALK_WEBHOOK"
+    if [ -n "$sign" ]; then
+        url="${url}&timestamp=${timestamp}&sign=${sign}"
+    fi
+    
+    # 构造请求体
+    local request_body=$(cat <<EOF
+{
+    "msgtype": "markdown",
+    "markdown": {
+        "title": "$title",
+        "text": "**$title**\n\n$message\n\n---\n时间: $(date '+%Y-%m-%d %H:%M:%S')\n主机: $(hostname)"
+    },
+    "at": {
+        "isAtAll": false
+    }
+}
+EOF
+    )
+    
+    # 发送请求
+    local response=$(curl -s -X POST -H "Content-Type: application/json" -d "$request_body" "$url")
+    
+    if echo "$response" | grep -q '"errcode":0'; then
+        echo -e "${GREEN}钉钉消息发送成功${NC}"
+        return 0
+    else
+        echo -e "${RED}钉钉消息发送失败: $response${NC}"
+        return 1
+    fi
+}
+
+# 发送PlusPush消息
+send_pluspush_message() {
+    local message="$1"
+    local title="$2"
+    
+    if [ -z "$PUSH_PLUSPUSH_TOKEN" ]; then
+        echo -e "${RED}PlusPush推送未配置，无法发送消息${NC}"
+        return 1
+    fi
+    
+    local request_body=$(cat <<EOF
+{
+    "token": "$PUSH_PLUSPUSH_TOKEN",
+    "title": "$title",
+    "content": "$message\n\n主机: $(hostname)\n时间: $(date '+%Y-%m-%d %H:%M:%S')",
+    "template": "markdown"
+}
+EOF
+    )
+    
+    local response=$(curl -s -X POST -H "Content-Type: application/json" \
+        -d "$request_body" "https://www.pushplus.plus/send")
+    
+    if echo "$response" | grep -q '"code":200'; then
+        echo -e "${GREEN}PlusPush消息发送成功${NC}"
+        return 0
+    else
+        echo -e "${RED}PlusPush消息发送失败: $response${NC}"
+        return 1
+    fi
+}
+
+# 发送泛微OA消息
+send_weoa_message() {
+    local message="$1"
+    local title="$2"
+    
+    if [ -z "$PUSH_WEOA_WEBHOOK" ] || [ -z "$PUSH_WEOA_KEY" ]; then
+        echo -e "${RED}泛微OA推送未配置，无法发送消息${NC}"
+        return 1
+    fi
+    
+    local request_body=$(cat <<EOF
+{
+    "key": "$PUSH_WEOA_KEY",
+    "title": "$title",
+    "content": "$message",
+    "host": "$(hostname)",
+    "time": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    )
+    
+    local response=$(curl -s -X POST -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $PUSH_WEOA_KEY" \
+        -d "$request_body" "$PUSH_WEOA_WEBHOOK")
+    
+    if echo "$response" | grep -q '"success":true'; then
+        echo -e "${GREEN}泛微OA消息发送成功${NC}"
+        return 0
+    else
+        echo -e "${RED}泛微OA消息发送失败: $response${NC}"
+        return 1
+    fi
+}
+
+# 发送自定义消息
+send_custom_message() {
+    local message="$1"
+    local title="$2"
+    
+    if [ -z "$PUSH_CUSTOM_WEBHOOK" ]; then
+        echo -e "${RED}自定义推送未配置，无法发送消息${NC}"
+        return 1
+    fi
+    
+    # 替换变量
+    local body_content=$(echo "$PUSH_CUSTOM_BODY" | sed \
+        -e "s/{{message}}/$message/g" \
+        -e "s/{{title}}/$title/g" \
+        -e "s/{{hostname}}/$(hostname)/g" \
+        -e "s/{{datetime}}/$(date '+%Y-%m-%d %H:%M:%S')/g" \
+        -e "s/{{date}}/$(date '+%Y-%m-%d')/g" \
+        -e "s/{{time}}/$(date '+%H:%M:%S')/g")
+    
+    # 发送请求
+    local curl_cmd="curl -s -X $PUSH_CUSTOM_METHOD"
+    
+    # 添加headers
+    if [ -n "$PUSH_CUSTOM_HEADERS" ]; then
+        # 将headers字符串拆分为数组
+        IFS=';' read -ra HEADERS <<< "$PUSH_CUSTOM_HEADERS"
+        for header in "${HEADERS[@]}"; do
+            if [ -n "$header" ]; then
+                curl_cmd="$curl_cmd -H \"$header\""
+            fi
+        done
+    fi
+    
+    # 添加请求体
+    if [ -n "$body_content" ]; then
+        curl_cmd="$curl_cmd -d '$body_content'"
+    fi
+    
+    # 添加URL并执行
+    curl_cmd="$curl_cmd \"$PUSH_CUSTOM_WEBHOOK\""
+    
+    local response=$(eval $curl_cmd 2>&1)
+    
+    if [ $? -eq 0 ] && [ -n "$response" ]; then
+        echo -e "${GREEN}自定义消息发送成功${NC}"
+        return 0
+    else
+        echo -e "${RED}自定义消息发送失败: $response${NC}"
+        return 1
+    fi
+}
+
+# 推送消息（主函数）
+push_message() {
+    local message="$1"
+    local title="$2"
+    
+    # 如果没有启用推送，直接返回
+    if [ "$PUSH_ENABLED" = "false" ]; then
+        return 0
+    fi
+    
+    echo -e "${CYAN}正在发送推送消息...${NC}"
+    
+    case "$PUSH_TYPE" in
+        "dingtalk")
+            send_dingtalk_message "$message" "$title"
+            ;;
+        "pluspush")
+            send_pluspush_message "$message" "$title"
+            ;;
+        "weoa")
+            send_weoa_message "$message" "$title"
+            ;;
+        "custom")
+            send_custom_message "$message" "$title"
+            ;;
+        *)
+            echo -e "${RED}未知的推送类型: $PUSH_TYPE${NC}"
+            return 1
+            ;;
+    esac
+    
+    return $?
+}
+
+# 发送操作完成推送
+send_operation_completed_push() {
+    local operation_name="$1"
+    local operation_status="$2"
+    local details="$3"
+    
+    # 如果没有启用推送，直接返回
+    if [ "$PUSH_ENABLED" = "false" ]; then
+        return 0
+    fi
+    
+    local message="操作: $operation_name\n状态: $operation_status\n主机: $(hostname)\n时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    if [ -n "$details" ]; then
+        message="$message\n详情: $details"
+    fi
+    
+    push_message "$message" "Linux面板操作完成通知"
+}
+
+# 为函数添加推送功能（封装函数）
+function_with_push() {
+    local func_name="$1"
+    local func_display_name="$2"
+    shift 2
+    
+    echo -e "${CYAN}正在执行: $func_display_name${NC}"
+    echo ""
+    
+    # 执行原函数
+    "$func_name" "$@"
+    
+    # 获取函数执行结果
+    local exit_code=$?
+    local status_text="成功"
+    
+    if [ $exit_code -eq 0 ]; then
+        status_text="成功"
+    else
+        status_text="失败"
+    fi
+    
+    # 发送推送消息
+    send_operation_completed_push "$func_display_name" "$status_text" ""
+    
+    return $exit_code
+}
+
+# 配置消息推送
+configure_push_notification() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}         消息推送配置${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    # 加载现有配置
+    load_push_config
+    
+    echo -e "${CYAN}当前推送状态: ${PUSH_ENABLED}${NC}"
+    echo -e "${CYAN}当前推送类型: ${PUSH_TYPE}${NC}"
+    echo ""
+    
+    echo -e "${GREEN}1.${NC} 启用/禁用推送"
+    echo -e "${GREEN}2.${NC} 配置钉钉推送"
+    echo -e "${GREEN}3.${NC} 配置PlusPush推送"
+    echo -e "${GREEN}4.${NC} 配置泛微OA推送"
+    echo -e "${GREEN}5.${NC} 配置自定义推送"
+    echo -e "${GREEN}6.${NC} 测试推送"
+    echo -e "${GREEN}7.${NC} 返回主菜单"
+    echo ""
+    
+    read -p "请选择功能 (1-7): " choice
+    
+    case $choice in
+        1)
+            # 启用/禁用推送
+            if [ "$PUSH_ENABLED" = "true" ]; then
+                PUSH_ENABLED="false"
+                echo -e "${YELLOW}已禁用消息推送${NC}"
+            else
+                PUSH_ENABLED="true"
+                echo -e "${GREEN}已启用消息推送${NC}"
+            fi
+            save_push_config
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+        2)
+            # 配置钉钉推送
+            echo -e "${CYAN}配置钉钉推送${NC}"
+            echo ""
+            read -p "请输入钉钉机器人Webhook地址: " PUSH_DINGTALK_WEBHOOK
+            read -p "请输入钉钉机器人密钥（可选，留空跳过）: " PUSH_DINGTALK_SECRET
+            
+            if [ -n "$PUSH_DINGTALK_WEBHOOK" ]; then
+                PUSH_TYPE="dingtalk"
+                PUSH_ENABLED="true"
+                save_push_config
+                echo -e "${GREEN}钉钉推送配置已保存${NC}"
+            else
+                echo -e "${RED}Webhook地址不能为空${NC}"
+            fi
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+        3)
+            # 配置PlusPush推送
+            echo -e "${CYAN}配置PlusPush推送${NC}"
+            echo ""
+            read -p "请输入PlusPush Token: " PUSH_PLUSPUSH_TOKEN
+            
+            if [ -n "$PUSH_PLUSPUSH_TOKEN" ]; then
+                PUSH_TYPE="pluspush"
+                PUSH_ENABLED="true"
+                save_push_config
+                echo -e "${GREEN}PlusPush推送配置已保存${NC}"
+            else
+                echo -e "${RED}Token不能为空${NC}"
+            fi
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+        4)
+            # 配置泛微OA推送
+            echo -e "${CYAN}配置泛微OA推送${NC}"
+            echo ""
+            read -p "请输入泛微OA Webhook地址: " PUSH_WEOA_WEBHOOK
+            read -p "请输入泛微OA Key: " PUSH_WEOA_KEY
+            
+            if [ -n "$PUSH_WEOA_WEBHOOK" ] && [ -n "$PUSH_WEOA_KEY" ]; then
+                PUSH_TYPE="weoa"
+                PUSH_ENABLED="true"
+                save_push_config
+                echo -e "${GREEN}泛微OA推送配置已保存${NC}"
+            else
+                echo -e "${RED}Webhook地址和Key都不能为空${NC}"
+            fi
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+        5)
+            # 配置自定义推送
+            echo -e "${CYAN}配置自定义推送${NC}"
+            echo ""
+            read -p "请输入自定义Webhook地址: " PUSH_CUSTOM_WEBHOOK
+            read -p "请输入请求方法 (默认: POST): " PUSH_CUSTOM_METHOD
+            PUSH_CUSTOM_METHOD=${PUSH_CUSTOM_METHOD:-POST}
+            
+            echo -e "请输入请求头（多个用分号分隔，如：Content-Type: application/json;Authorization: Bearer token）:"
+            read PUSH_CUSTOM_HEADERS
+            
+            echo -e "请输入请求体模板（可使用变量：{{message}}, {{title}}, {{hostname}}, {{datetime}}, {{date}}, {{time}}）:"
+            read PUSH_CUSTOM_BODY
+            
+            if [ -n "$PUSH_CUSTOM_WEBHOOK" ]; then
+                PUSH_TYPE="custom"
+                PUSH_ENABLED="true"
+                save_push_config
+                echo -e "${GREEN}自定义推送配置已保存${NC}"
+            else
+                echo -e "${RED}Webhook地址不能为空${NC}"
+            fi
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+        6)
+            # 测试推送
+            echo -e "${CYAN}测试推送功能${NC}"
+            echo ""
+            
+            load_push_config
+            
+            if [ "$PUSH_ENABLED" = "false" ]; then
+                echo -e "${YELLOW}推送功能未启用，请先配置推送${NC}"
+                read -p "按回车键继续..."
+                configure_push_notification
+                return
+            fi
+            
+            local test_message="这是一条测试消息，用于验证推送功能是否正常工作。"
+            local test_title="Linux面板脚本测试推送"
+            
+            echo -e "推送类型: ${YELLOW}$PUSH_TYPE${NC}"
+            echo -e "推送消息: ${YELLOW}$test_message${NC}"
+            echo ""
+            
+            push_message "$test_message" "$test_title"
+            
+            echo ""
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+        7)
+            # 返回主菜单
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            read -p "按回车键继续..."
+            configure_push_notification
+            ;;
+    esac
+}
+
 # 由于时间关系，我先完成主要功能框架，后续可以继续完善具体实现
 
 # 主菜单
@@ -3587,55 +4588,63 @@ main_menu() {
         echo -e "${GREEN}11.${NC} 数据库备份功能"
         echo -e "${GREEN}12.${NC} Docker镜像源切换"
         echo -e "${GREEN}13.${NC} 防火墙端口管理"
-        echo -e "${GREEN}14.${NC} 退出脚本"
+        echo -e "${GREEN}14.${NC} DNS污染检测与优化"
+        echo -e "${GREEN}15.${NC} 消息推送配置"
+        echo -e "${GREEN}16.${NC} 退出脚本"
         echo ""
         echo -e "${YELLOW}========================================${NC}"
         echo -e "${YELLOW}提示: 请确保系统有足够的磁盘空间和内存${NC}"
         echo ""
         
-        read -p "请选择功能 (1-14): " choice
+        read -p "请选择功能 (1-16): " choice
         
         case $choice in
             1)
-                install_baota
+                function_with_push "install_baota" "安装宝塔面板"
                 ;;
             2)
-                install_ne_zha
+                function_with_push "install_ne_zha" "安装哪吒监控面板"
                 ;;
             3)
-                install_xui
+                function_with_push "install_xui" "安装 X-UI 面板"
                 ;;
             4)
-                fix_github_dns
+                function_with_push "fix_github_dns" "GitHub DNS污染检测与修复"
                 ;;
             5)
-                fix_docker_dns
+                function_with_push "fix_docker_dns" "Docker镜像源DNS检测与修复"
                 ;;
             6)
-                install_docker
+                function_with_push "install_docker" "安装 Docker"
                 ;;
             7)
-                show_system_info
+                function_with_push "show_system_info" "查看服务器信息"
                 ;;
             8)
-                network_speed_test
+                function_with_push "network_speed_test" "网络测速功能"
                 ;;
             9)
-                time_sync
+                function_with_push "time_sync" "时间校准功能"
                 ;;
             10)
-                nas_mount_config
+                function_with_push "nas_mount_config" "NAS配置功能"
                 ;;
             11)
-                database_backup
+                function_with_push "database_backup" "数据库备份功能"
                 ;;
             12)
-                docker_mirror_switch
+                function_with_push "docker_mirror_switch" "Docker镜像源切换"
                 ;;
             13)
-                firewall_management
+                function_with_push "firewall_management" "防火墙端口管理"
                 ;;
             14)
+                function_with_push "dns_pollution_detection" "DNS污染检测与优化"
+                ;;
+            15)
+                function_with_push "configure_push_notification" "消息推送配置"
+                ;;
+            16)
                 echo -e "${GREEN}感谢使用，再见！${NC}"
                 exit 0
                 ;;
@@ -4170,11 +5179,14 @@ main() {
     echo -e "${PURPLE}========================================${NC}"
     echo -e "${PURPLE}      Linux 面板与工具安装脚本${NC}"
     echo -e "${PURPLE}========================================${NC}"
-    echo -e "${CYAN}版本: 2.0${NC}"
-    echo -e "${CYAN}更新: 添加系统监控、网络测速、时间校准、NAS配置、数据库备份、Docker镜像源切换、防火墙管理功能${NC}"
+    echo -e "${CYAN}版本: 2.1${NC}"
+    echo -e "${CYAN}更新: 添加DNS污染检测与优化、消息推送配置功能，集成Docker DNS修复到安装流程${NC}"
     echo -e "${CYAN}作者: Linux运维助手${NC}"
     echo -e "${CYAN}日期: $(date)${NC}"
     echo ""
+    
+    # 加载推送配置
+    load_push_config
     
     # 获取系统信息
     get_system_info
