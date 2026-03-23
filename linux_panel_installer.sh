@@ -15,6 +15,10 @@ OS_INFO=""
 ARCH=""
 DISTRO=""
 
+# DNS检测相关
+GITHUB_DOMAINS="github.com raw.githubusercontent.com github.github.io api.github.com"
+DNS_TEST_URL="https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/oh-my-zsh.sh"
+
 # 检查是否以root用户运行
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -332,6 +336,94 @@ install_docker() {
         echo -e "${RED}Docker 安装失败${NC}"
         read -p "按回车键返回主菜单..."
     fi
+}
+
+# 安装X-UI面板
+install_xui() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          安装 X-UI 面板${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}注意: X-UI 是一个多协议代理工具，请遵守当地法律法规${NC}"
+    echo ""
+    
+    # 检查是否已安装
+    if [ -f "/usr/local/x-ui/x-ui" ]; then
+        echo -e "${GREEN}X-UI 已安装${NC}"
+        echo -e "面板地址: http://$(hostname -I | awk '{print $1}'):54321"
+        echo -e "默认用户名: admin"
+        echo -e "默认密码: admin"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo -e "${CYAN}安装必要依赖...${NC}"
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            yum install -y wget curl unzip
+            ;;
+        "ubuntu"|"debian")
+            apt update && apt install -y wget curl unzip
+            ;;
+    esac
+    
+    echo -e "${CYAN}下载 X-UI 安装脚本...${NC}"
+    wget -O x-ui-install.sh https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh
+    
+    if [ ! -f "x-ui-install.sh" ]; then
+        echo -e "${RED}下载安装脚本失败，请检查网络连接${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    chmod +x x-ui-install.sh
+    
+    echo ""
+    echo -e "${YELLOW}X-UI 安装选项:${NC}"
+    echo -e "1. 全新安装"
+    echo -e "2. 更新已有安装"
+    echo ""
+    
+    read -p "请选择安装类型 (默认1): " install_type
+    install_type=${install_type:-1}
+    
+    echo ""
+    echo -e "${CYAN}开始安装 X-UI...${NC}"
+    
+    if [ "$install_type" = "1" ]; then
+        bash x-ui-install.sh
+    else
+        bash x-ui-install.sh update
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}X-UI 安装完成！${NC}"
+        echo ""
+        echo -e "${CYAN}安装信息:${NC}"
+        echo -e "面板地址: http://$(hostname -I | awk '{print $1}'):54321"
+        echo -e "默认用户名: admin"
+        echo -e "默认密码: admin"
+        echo ""
+        echo -e "${CYAN}常用命令:${NC}"
+        echo -e "启动服务: systemctl start x-ui"
+        echo -e "停止服务: systemctl stop x-ui"
+        echo -e "重启服务: systemctl restart x-ui"
+        echo -e "查看状态: systemctl status x-ui"
+        echo -e "查看日志: journalctl -u x-ui -f"
+        echo ""
+        echo -e "${YELLOW}安全提示:${NC}"
+        echo -e "1. 请立即修改默认密码"
+        echo -e "2. 建议修改默认端口"
+        echo -e "3. 配置防火墙规则"
+        echo -e "4. 定期更新系统和X-UI"
+    else
+        echo -e "${RED}X-UI 安装失败${NC}"
+        echo -e "请检查日志文件: /var/log/x-ui/install.log"
+    fi
+    
+    read -p "按回车键返回主菜单..."
 }
 
 # Docker功能菜单
@@ -950,6 +1042,207 @@ docker_management() {
     done
 }
 
+# DNS污染检测与GitHub IP修复
+fix_github_dns() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}      GitHub DNS污染检测与修复${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}正在检测GitHub域名DNS污染情况...${NC}"
+    echo ""
+    
+    # 检查DNS解析是否正常
+    local dns_ok=true
+    local domains=($GITHUB_DOMAINS)
+    
+    for domain in "${domains[@]}"; do
+        echo -e "检测域名: ${YELLOW}$domain${NC}"
+        
+        # 尝试解析域名
+        local ip_result
+        ip_result=$(dig +short $domain @8.8.8.8 2>/dev/null | head -1)
+        
+        if [ -z "$ip_result" ]; then
+            echo -e "  ${RED}✗ DNS解析失败${NC}"
+            dns_ok=false
+        elif [[ $ip_result =~ ^(127\.|0\.|169\.254|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.) ]]; then
+            echo -e "  ${RED}✗ 检测到污染IP: $ip_result${NC}"
+            dns_ok=false
+        else
+            echo -e "  ${GREEN}✓ 解析正常: $ip_result${NC}"
+        fi
+    done
+    
+    echo ""
+    
+    if $dns_ok; then
+        echo -e "${GREEN}DNS解析正常，无需修复${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo -e "${YELLOW}检测到DNS污染问题，正在获取最新可用的GitHub IP地址...${NC}"
+    echo ""
+    
+    # 从多个来源获取最新的GitHub IP地址
+    echo -e "${CYAN}尝试从多个来源获取GitHub IP地址...${NC}"
+    
+    # 常见的GitHub IP地址（这些需要定期更新）
+    local github_ips=()
+    
+    # 尝试从ipaddress.com获取
+    echo -e "1. 从ipaddress.com获取..."
+    local ip1=$(curl -s https://ipaddress.com/website/github.com | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -5 | tail -1 2>/dev/null)
+    if [ -n "$ip1" ]; then
+        github_ips+=("$ip1")
+        echo -e "   ${GREEN}获取到IP: $ip1${NC}"
+    else
+        echo -e "   ${YELLOW}获取失败${NC}"
+    fi
+    
+    # 尝试从chinaz.com获取
+    echo -e "2. 从站长之家获取..."
+    local ip2=$(curl -s "http://ping.chinaz.com/github.com" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -3 | tail -1 2>/dev/null)
+    if [ -n "$ip2" ]; then
+        github_ips+=("$ip2")
+        echo -e "   ${GREEN}获取到IP: $ip2${NC}"
+    else
+        echo -e "   ${YELLOW}获取失败${NC}"
+    fi
+    
+    # 备用IP地址列表（这些是GitHub的常用IP段）
+    local backup_ips=(
+        "20.205.243.166"  # GitHub常用IP
+        "20.27.177.113"   # GitHub常用IP
+        "192.30.255.113"  # GitHub官方IP
+        "140.82.114.4"    # GitHub官方IP
+        "140.82.112.4"    # GitHub官方IP
+        "140.82.113.4"    # GitHub官方IP
+    )
+    
+    # 如果没有获取到IP，使用备用IP
+    if [ ${#github_ips[@]} -eq 0 ]; then
+        echo -e "${YELLOW}从在线服务获取失败，使用备用IP地址${NC}"
+        github_ips=("${backup_ips[@]}")
+    fi
+    
+    echo ""
+    echo -e "${CYAN}测试IP地址连通性...${NC}"
+    
+    local best_ip=""
+    local best_time=99999
+    
+    # 测试每个IP的连通性
+    for ip in "${github_ips[@]}"; do
+        echo -e "测试IP: ${YELLOW}$ip${NC}"
+        
+        # 使用ping测试延迟
+        local ping_result
+        ping_result=$(timeout 3 ping -c 2 -W 1 $ip 2>/dev/null | grep "time=" | head -1 | awk -F'time=' '{print $2}' | awk '{print $1}')
+        
+        if [ -n "$ping_result" ]; then
+            echo -e "  ${GREEN}✓ 延迟: ${ping_result}ms${NC}"
+            
+            # 转换为整数比较
+            local ping_int=$(echo "$ping_result" | cut -d'.' -f1)
+            
+            if [ -z "$ping_int" ]; then
+                ping_int=0
+            fi
+            
+            if [ $ping_int -lt $best_time ]; then
+                best_time=$ping_int
+                best_ip=$ip
+            fi
+        else
+            echo -e "  ${RED}✗ 无法连接${NC}"
+        fi
+    done
+    
+    echo ""
+    
+    if [ -z "$best_ip" ]; then
+        echo -e "${RED}所有IP地址都无法连接，无法修复DNS问题${NC}"
+        echo -e "${YELLOW}建议检查网络连接或使用代理${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    
+    echo -e "${GREEN}找到最佳IP地址: ${best_ip} (延迟: ${best_time}ms)${NC}"
+    echo ""
+    
+    echo -e "${CYAN}备份当前hosts文件...${NC}"
+    cp /etc/hosts /etc/hosts.backup.$(date +%Y%m%d_%H%M%S)
+    echo -e "备份文件: ${YELLOW}/etc/hosts.backup.$(date +%Y%m%d_%H%M%S)${NC}"
+    
+    echo ""
+    echo -e "${CYAN}更新hosts文件...${NC}"
+    
+    # 创建临时hosts文件
+    local temp_hosts=$(mktemp)
+    
+    # 复制原有hosts文件，但移除旧的GitHub条目
+    grep -v -E "(github\.com|raw\.githubusercontent\.com|github\.github\.io|api\.github\.com)" /etc/hosts > "$temp_hosts"
+    
+    # 添加新的GitHub条目
+    echo "" >> "$temp_hosts"
+    echo "# GitHub domains (updated by Linux Panel Installer on $(date))" >> "$temp_hosts"
+    echo "$best_ip github.com" >> "$temp_hosts"
+    echo "$best_ip raw.githubusercontent.com" >> "$temp_hosts"
+    echo "$best_ip github.github.io" >> "$temp_hosts"
+    echo "$best_ip api.github.com" >> "$temp_hosts"
+    
+    # 替换原有hosts文件
+    cp "$temp_hosts" /etc/hosts
+    rm -f "$temp_hosts"
+    
+    echo -e "${GREEN}hosts文件更新完成！${NC}"
+    echo ""
+    
+    # 刷新DNS缓存
+    echo -e "${CYAN}刷新DNS缓存...${NC}"
+    
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            systemctl restart systemd-resolved 2>/dev/null || systemctl restart NetworkManager 2>/dev/null
+            ;;
+        "ubuntu"|"debian")
+            systemctl restart systemd-resolved 2>/dev/null || /etc/init.d/nscd restart 2>/dev/null
+            ;;
+    esac
+    
+    echo -e "${GREEN}DNS缓存已刷新${NC}"
+    echo ""
+    
+    # 测试修复效果
+    echo -e "${CYAN}测试修复效果...${NC}"
+    
+    local test_result
+    test_result=$(curl -s -I --connect-timeout 5 "$DNS_TEST_URL" 2>/dev/null | head -1)
+    
+    if [[ "$test_result" == *"200"* ]] || [[ "$test_result" == *"302"* ]]; then
+        echo -e "${GREEN}✓ 修复成功！GitHub访问已恢复正常${NC}"
+        
+        # 显示更新后的hosts文件相关部分
+        echo ""
+        echo -e "${CYAN}更新后的hosts文件内容（GitHub相关）:${NC}"
+        grep -A5 "GitHub domains" /etc/hosts
+    else
+        echo -e "${YELLOW}⚠ 修复可能未完全生效，建议重启网络服务${NC}"
+        echo -e "  可以尝试执行: systemctl restart network 或 systemctl restart networking"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}提示:${NC}"
+    echo -e "1. 如果GitHub访问仍然有问题，可能需要重启系统"
+    echo -e "2. GitHub IP地址可能会变化，建议定期运行此功能更新"
+    echo -e "3. 原始hosts文件已备份: /etc/hosts.backup.*"
+    
+    read -p "按回车键返回主菜单..."
+}
+
 # 主菜单
 main_menu() {
     while true; do
@@ -964,15 +1257,17 @@ main_menu() {
         echo ""
         echo -e "${GREEN}1.${NC} 安装宝塔面板"
         echo -e "${GREEN}2.${NC} 安装哪吒监控面板"
-        echo -e "${GREEN}3.${NC} 安装 Docker"
-        echo -e "${GREEN}4.${NC} 服务器信息"
-        echo -e "${GREEN}5.${NC} 退出脚本"
+        echo -e "${GREEN}3.${NC} 安装 X-UI 面板"
+        echo -e "${GREEN}4.${NC} DNS污染检测与修复"
+        echo -e "${GREEN}5.${NC} 安装 Docker"
+        echo -e "${GREEN}6.${NC} 服务器信息"
+        echo -e "${GREEN}7.${NC} 退出脚本"
         echo ""
         echo -e "${YELLOW}========================================${NC}"
         echo -e "${YELLOW}提示: 请确保系统有足够的磁盘空间和内存${NC}"
         echo ""
         
-        read -p "请选择功能 (1-5): " choice
+        read -p "请选择功能 (1-7): " choice
         
         case $choice in
             1)
@@ -982,12 +1277,18 @@ main_menu() {
                 install_ne_zha
                 ;;
             3)
-                install_docker
+                install_xui
                 ;;
             4)
-                show_system_info
+                fix_github_dns
                 ;;
             5)
+                install_docker
+                ;;
+            6)
+                show_system_info
+                ;;
+            7)
                 echo -e "${GREEN}感谢使用，再见！${NC}"
                 exit 0
                 ;;
@@ -1009,7 +1310,8 @@ main() {
     echo -e "${PURPLE}========================================${NC}"
     echo -e "${PURPLE}      Linux 面板与工具安装脚本${NC}"
     echo -e "${PURPLE}========================================${NC}"
-    echo -e "${CYAN}版本: 1.0${NC}"
+    echo -e "${CYAN}版本: 1.2${NC}"
+    echo -e "${CYAN}更新: 添加DNS污染检测与修复功能${NC}"
     echo -e "${CYAN}作者: Linux运维助手${NC}"
     echo -e "${CYAN}日期: $(date)${NC}"
     echo ""
