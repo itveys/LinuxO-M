@@ -23,7 +23,7 @@
 
 ### 1. 下载脚本
 ```bash
-wget https://raw.githubusercontent.com/your-repo/linux_panel_installer.sh
+wget https://raw.githubusercontent.com/itveys/LinuxO-M/main/linux_panel_installer.sh
 ```
 
 ### 2. 赋予执行权限
