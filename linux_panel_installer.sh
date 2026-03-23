@@ -1676,7 +1676,7 @@ fix_github_dns() {
         read -p "是否继续标准DNS修复？(y/n, 默认y): " continue_repair
         continue_repair=${continue_repair:-y}
         
-        if [[ $continue_repair != "y" && $continue_repair != "Y" ]; then
+        if [[ $continue_repair != "y" && $continue_repair != "Y" ]]; then
             echo -e "${YELLOW}已返回主菜单${NC}"
             read -p "按回车键继续..."
             return
