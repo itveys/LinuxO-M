@@ -35,6 +35,294 @@ PUSH_CUSTOM_METHOD="POST"
 PUSH_CUSTOM_HEADERS=""
 PUSH_CUSTOM_BODY=""
 
+# 定时任务配置
+CRON_TASK_FILE="/etc/cron.d/linux_panel_tasks"
+CRON_TASK_REGISTRY="/etc/linux_panel_tasks.list"
+CRON_TASK_DIR="/opt/linux_panel_tasks"
+CRON_LOG_DIR="/var/log/linux_panel_tasks"
+
+# 菜单超时设置（秒）
+MENU_TIMEOUT=60
+
+# 通用工具函数
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+pause() {
+    read -p "${1:-按回车键继续...}"
+}
+
+read_menu_choice() {
+    local prompt="$1"
+    local var_name="$2"
+    local timeout="${3:-$MENU_TIMEOUT}"
+
+    if read -t "$timeout" -p "$prompt" "$var_name"; then
+        return 0
+    fi
+
+    echo -e "\n${YELLOW}操作超时，返回上一级...${NC}"
+    return 1
+}
+
+get_primary_ip() {
+    local ip
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return
+    fi
+    ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+    if [ -n "$ip" ]; then
+        echo "$ip"
+        return
+    fi
+    ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+    echo "${ip:-无法获取}"
+}
+
+get_public_ip() {
+    local urls=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://ipv4.icanhazip.com"
+    )
+    local url
+    for url in "${urls[@]}"; do
+        if command_exists curl; then
+            local ip
+            ip=$(curl -fsSL --connect-timeout 5 "$url" 2>/dev/null | tr -d '\r')
+            if [ -n "$ip" ]; then
+                echo "$ip"
+                return
+            fi
+        elif command_exists wget; then
+            local ip
+            ip=$(wget -qO- "$url" 2>/dev/null | tr -d '\r')
+            if [ -n "$ip" ]; then
+                echo "$ip"
+                return
+            fi
+        fi
+    done
+    echo "无法获取"
+}
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+
+    if command_exists curl; then
+        curl -fsSL --retry 3 --connect-timeout 10 "$url" -o "$dest"
+        return $?
+    fi
+    if command_exists wget; then
+        wget -qO "$dest" "$url"
+        return $?
+    fi
+
+    echo -e "${RED}缺少下载工具: curl 或 wget${NC}"
+    return 1
+}
+
+ensure_download_tool() {
+    if command_exists curl || command_exists wget; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}未检测到 curl/wget，尝试安装...${NC}"
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            yum install -y curl wget
+            ;;
+        "ubuntu"|"debian")
+            apt update && apt install -y curl wget
+            ;;
+        *)
+            echo -e "${RED}无法自动安装下载工具，请手动安装 curl 或 wget${NC}"
+            return 1
+            ;;
+    esac
+
+    if command_exists curl || command_exists wget; then
+        return 0
+    fi
+
+    echo -e "${RED}下载工具安装失败，请检查网络或包管理器${NC}"
+    return 1
+}
+
+get_docker_compose_cmd() {
+    if command_exists docker-compose; then
+        echo "docker-compose"
+        return
+    fi
+    if command_exists docker && docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+        return
+    fi
+    echo "docker-compose"
+}
+
+docker_compose() {
+    if command_exists docker-compose; then
+        docker-compose "$@"
+        return $?
+    fi
+    if command_exists docker && docker compose version >/dev/null 2>&1; then
+        docker compose "$@"
+        return $?
+    fi
+    echo -e "${RED}Docker Compose 未安装或不可用${NC}"
+    return 1
+}
+
+backup_file_if_exists() {
+    local file_path="$1"
+    if [ -f "$file_path" ]; then
+        local backup_path="${file_path}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$file_path" "$backup_path"
+        echo -e "${YELLOW}已备份: $backup_path${NC}"
+    fi
+}
+
+update_docker_daemon_json() {
+    local mirror_url="$1"
+    local config_file="/etc/docker/daemon.json"
+
+    mkdir -p /etc/docker
+    backup_file_if_exists "$config_file"
+
+    if command_exists python3; then
+        MIRROR_URL="$mirror_url" python3 - << 'PY'
+import json
+import os
+import sys
+
+config_file = "/etc/docker/daemon.json"
+    mirror_url = os.environ.get("MIRROR_URL", "")
+
+data = {}
+if os.path.exists(config_file):
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+if mirror_url:
+    data["registry-mirrors"] = [mirror_url]
+else:
+    data.pop("registry-mirrors", None)
+
+with open(config_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+PY
+        return $?
+    fi
+
+    if [ -z "$mirror_url" ]; then
+        cat > "$config_file" << 'EOF'
+{}
+EOF
+        return 0
+    fi
+
+    cat > "$config_file" << EOF
+{
+  "registry-mirrors": ["$mirror_url"]
+}
+EOF
+    return 0
+}
+
+init_cron_env() {
+    mkdir -p "$CRON_TASK_DIR" "$CRON_LOG_DIR"
+    touch "$CRON_TASK_REGISTRY"
+    chmod 600 "$CRON_TASK_REGISTRY"
+    if [ ! -f "$CRON_TASK_FILE" ]; then
+        cat > "$CRON_TASK_FILE" << 'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+    fi
+}
+
+render_cron_file() {
+    local temp_file
+    temp_file=$(mktemp)
+    cat > "$temp_file" << 'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+
+    while IFS='|' read -r task_id task_desc task_schedule task_cmd task_status; do
+        [ -z "$task_id" ] && continue
+        if [ "$task_status" = "disabled" ]; then
+            echo "# $task_schedule root $task_cmd >> $CRON_LOG_DIR/$task_id.log 2>&1" >> "$temp_file"
+        else
+            echo "$task_schedule root $task_cmd >> $CRON_LOG_DIR/$task_id.log 2>&1" >> "$temp_file"
+        fi
+    done < "$CRON_TASK_REGISTRY"
+
+    cp "$temp_file" "$CRON_TASK_FILE"
+    rm -f "$temp_file"
+}
+
+add_task_registry() {
+    local task_id="$1"
+    local task_desc="$2"
+    local task_schedule="$3"
+    local task_cmd="$4"
+    local task_status="$5"
+
+    echo "$task_id|$task_desc|$task_schedule|$task_cmd|$task_status" >> "$CRON_TASK_REGISTRY"
+}
+
+update_task_status() {
+    local task_id="$1"
+    local new_status="$2"
+    local temp_file
+    temp_file=$(mktemp)
+
+    while IFS='|' read -r id desc schedule cmd status; do
+        [ -z "$id" ] && continue
+        if [ "$id" = "$task_id" ]; then
+            echo "$id|$desc|$schedule|$cmd|$new_status" >> "$temp_file"
+        else
+            echo "$id|$desc|$schedule|$cmd|$status" >> "$temp_file"
+        fi
+    done < "$CRON_TASK_REGISTRY"
+
+    cp "$temp_file" "$CRON_TASK_REGISTRY"
+    rm -f "$temp_file"
+}
+
+remove_task_registry() {
+    local task_id="$1"
+    local temp_file
+    temp_file=$(mktemp)
+
+    while IFS='|' read -r id desc schedule cmd status; do
+        [ -z "$id" ] && continue
+        if [ "$id" != "$task_id" ]; then
+            echo "$id|$desc|$schedule|$cmd|$status" >> "$temp_file"
+        fi
+    done < "$CRON_TASK_REGISTRY"
+
+    cp "$temp_file" "$CRON_TASK_REGISTRY"
+    rm -f "$temp_file"
+}
+
+validate_cron_expr() {
+    local expr="$1"
+    if [[ "$expr" =~ ^([^[:space:]]+[[:space:]]+){4}[^[:space:]]+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # 检查是否以root用户运行
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -136,8 +424,8 @@ show_system_info() {
     
     # 网络信息
     echo -e "${CYAN}=== 网络信息 ===${NC}"
-    echo -e "${GREEN}公网IP:${NC} $(curl -s ifconfig.me || echo "无法获取")"
-    echo -e "${GREEN}内网IP:${NC} $(hostname -I | awk '{print $1}')"
+    echo -e "${GREEN}公网IP:${NC} $(get_public_ip)"
+    echo -e "${GREEN}内网IP:${NC} $(get_primary_ip)"
     echo ""
     
     # 系统运行时间
@@ -215,7 +503,9 @@ real_time_monitor() {
         
         # CPU使用率条形图
         local cpu_bar="["
-        local filled=$((cpu_usage / 5))
+        # 将浮点数转换为整数（去掉小数点）
+        local cpu_usage_int=$(echo "$cpu_usage" | awk -F. '{print $1}')
+        local filled=$((cpu_usage_int / 5))
         for ((i=0; i<20; i++)); do
             if [ $i -lt $filled ]; then
                 cpu_bar+="█"
@@ -379,7 +669,7 @@ install_baota() {
     # 检查是否已安装
     if command -v bt &> /dev/null; then
         echo -e "${GREEN}宝塔面板已安装${NC}"
-        echo -e "面板地址: https://$(hostname -I | awk '{print $1}'):8888"
+        echo -e "面板地址: https://$(get_primary_ip):8888"
         echo -e "默认用户名: admin"
         echo -e "获取默认密码: bt default"
         read -p "按回车键返回主菜单..."
@@ -390,11 +680,31 @@ install_baota() {
     case $DISTRO in
         "centos"|"rhel"|"fedora")
             echo -e "${CYAN}检测到 CentOS/RHEL/Fedora 系统，使用yum安装...${NC}"
-            yum install -y wget && wget -O install.sh https://download.bt.cn/install/install_6.0.sh && bash install.sh
+            if ! ensure_download_tool; then
+                read -p "按回车键返回主菜单..."
+                return
+            fi
+            if download_file "https://download.bt.cn/install/install_6.0.sh" "install.sh"; then
+                bash install.sh
+            else
+                echo -e "${RED}下载安装脚本失败，请检查网络连接${NC}"
+                read -p "按回车键返回主菜单..."
+                return
+            fi
             ;;
         "ubuntu"|"debian")
             echo -e "${CYAN}检测到 Ubuntu/Debian 系统，使用apt安装...${NC}"
-            wget -O install.sh https://download.bt.cn/install/install-ubuntu_6.0.sh && bash install.sh
+            if ! ensure_download_tool; then
+                read -p "按回车键返回主菜单..."
+                return
+            fi
+            if download_file "https://download.bt.cn/install/install-ubuntu_6.0.sh" "install.sh"; then
+                bash install.sh
+            else
+                echo -e "${RED}下载安装脚本失败，请检查网络连接${NC}"
+                read -p "按回车键返回主菜单..."
+                return
+            fi
             ;;
         *)
             echo -e "${RED}不支持的系统: $DISTRO${NC}"
@@ -408,7 +718,7 @@ install_baota() {
         echo -e "${GREEN}宝塔面板安装完成！${NC}"
         echo ""
         echo -e "${CYAN}安装信息:${NC}"
-        echo -e "面板地址: https://$(hostname -I | awk '{print $1}'):8888"
+        echo -e "面板地址: https://$(get_primary_ip):8888"
         echo -e "默认用户名: admin"
         echo -e "获取默认密码请执行: bt default"
         echo ""
@@ -451,10 +761,14 @@ install_ne_zha() {
     
     # 下载安装脚本
     echo -e "${CYAN}下载哪吒面板安装脚本...${NC}"
-    wget -O nezha.sh https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh
+    if ! ensure_download_tool; then
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    download_file "https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh" "nezha.sh"
     chmod +x nezha.sh
     
-    if [ ! -f "nezha.sh" ]; then
+    if [ ! -s "nezha.sh" ]; then
         echo -e "${RED}下载安装脚本失败，请检查网络连接${NC}"
         read -p "按回车键返回主菜单..."
         return
@@ -634,7 +948,7 @@ install_xui() {
     # 检查是否已安装
     if [ -f "/usr/local/x-ui/x-ui" ]; then
         echo -e "${GREEN}X-UI 已安装${NC}"
-        echo -e "面板地址: http://$(hostname -I | awk '{print $1}'):54321"
+        echo -e "面板地址: http://$(get_primary_ip):54321"
         echo -e "默认用户名: admin"
         echo -e "默认密码: admin"
         read -p "按回车键返回主菜单..."
@@ -652,9 +966,13 @@ install_xui() {
     esac
     
     echo -e "${CYAN}下载 X-UI 安装脚本...${NC}"
-    wget -O x-ui-install.sh https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh
+    if ! ensure_download_tool; then
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    download_file "https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh" "x-ui-install.sh"
     
-    if [ ! -f "x-ui-install.sh" ]; then
+    if [ ! -s "x-ui-install.sh" ]; then
         echo -e "${RED}下载安装脚本失败，请检查网络连接${NC}"
         read -p "按回车键返回主菜单..."
         return
@@ -684,7 +1002,7 @@ install_xui() {
         echo -e "${GREEN}X-UI 安装完成！${NC}"
         echo ""
         echo -e "${CYAN}安装信息:${NC}"
-        echo -e "面板地址: http://$(hostname -I | awk '{print $1}'):54321"
+        echo -e "面板地址: http://$(get_primary_ip):54321"
         echo -e "默认用户名: admin"
         echo -e "默认密码: admin"
         echo ""
@@ -858,20 +1176,22 @@ output {
 EOF
     
     echo -e "${CYAN}启动 ELK 服务...${NC}"
-    docker-compose -f docker-compose-elk.yml up -d
+    docker_compose -f docker-compose-elk.yml up -d
     
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}ELK 安装完成！${NC}"
         echo ""
         echo -e "${CYAN}访问地址:${NC}"
-        echo -e "Kibana: http://$(hostname -I | awk '{print $1}'):5601"
-        echo -e "Elasticsearch: http://$(hostname -I | awk '{print $1}'):9200"
+        echo -e "Kibana: http://$(get_primary_ip):5601"
+        echo -e "Elasticsearch: http://$(get_primary_ip):9200"
         echo -e "Logstash: TCP端口 5000"
         echo ""
         echo -e "${YELLOW}管理命令:${NC}"
-        echo -e "停止服务: docker-compose -f docker-compose-elk.yml stop"
-        echo -e "启动服务: docker-compose -f docker-compose-elk.yml start"
-        echo -e "查看日志: docker-compose -f docker-compose-elk.yml logs -f"
+        local compose_cmd
+        compose_cmd=$(get_docker_compose_cmd)
+        echo -e "停止服务: ${compose_cmd} -f docker-compose-elk.yml stop"
+        echo -e "启动服务: ${compose_cmd} -f docker-compose-elk.yml start"
+        echo -e "查看日志: ${compose_cmd} -f docker-compose-elk.yml logs -f"
     else
         echo -e "${RED}ELK 安装失败${NC}"
     fi
@@ -912,7 +1232,7 @@ install_mysql() {
         echo -e "${GREEN}MySQL 安装完成！${NC}"
         echo ""
         echo -e "${CYAN}连接信息:${NC}"
-        echo -e "主机: $(hostname -I | awk '{print $1}')"
+        echo -e "主机: $(get_primary_ip)"
         echo -e "端口: 3306"
         echo -e "用户名: root"
         echo -e "密码: $mysql_pass"
@@ -999,7 +1319,7 @@ EOF
     
     # 替换占位符
     sed -i "s/SERVER_HOSTNAME/$(hostname)/g" $nginx_html/index.html
-    sed -i "s/SERVER_IP/$(hostname -I | awk '{print $1}')/g" $nginx_html/index.html
+    sed -i "s/SERVER_IP/$(get_primary_ip)/g" $nginx_html/index.html
     sed -i "s/SERVER_DATE/$(date)/g" $nginx_html/index.html
     
     echo -e "${CYAN}拉取 Nginx 镜像...${NC}"
@@ -1020,8 +1340,8 @@ EOF
         echo -e "${GREEN}Nginx 安装完成！${NC}"
         echo ""
         echo -e "${CYAN}访问地址:${NC}"
-        echo -e "HTTP: http://$(hostname -I | awk '{print $1}')"
-        echo -e "HTTPS: https://$(hostname -I | awk '{print $1}') (需要配置证书)"
+        echo -e "HTTP: http://$(get_primary_ip)"
+        echo -e "HTTPS: https://$(get_primary_ip) (需要配置证书)"
         echo ""
         echo -e "${CYAN}目录结构:${NC}"
         echo -e "配置文件: $nginx_conf"
@@ -1082,7 +1402,7 @@ install_redis() {
         echo -e "${GREEN}Redis 安装完成！${NC}"
         echo ""
         echo -e "${CYAN}连接信息:${NC}"
-        echo -e "主机: $(hostname -I | awk '{print $1}')"
+        echo -e "主机: $(get_primary_ip)"
         echo -e "端口: 6379"
         if [ -n "$redis_pass" ]; then
             echo -e "密码: $redis_pass"
@@ -1167,13 +1487,13 @@ networks:
 EOF
     
     echo -e "${CYAN}启动 WordPress 服务...${NC}"
-    docker-compose -f docker-compose-wordpress.yml up -d
+    docker_compose -f docker-compose-wordpress.yml up -d
     
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}WordPress 安装完成！${NC}"
         echo ""
         echo -e "${CYAN}访问地址:${NC}"
-        echo -e "WordPress: http://$(hostname -I | awk '{print $1}'):$wp_port"
+        echo -e "WordPress: http://$(get_primary_ip):$wp_port"
         echo ""
         echo -e "${CYAN}数据库信息:${NC}"
         echo -e "主机: db (容器内)"
@@ -1183,9 +1503,11 @@ EOF
         echo -e "密码: $wp_db_pass"
         echo ""
         echo -e "${YELLOW}管理命令:${NC}"
-        echo -e "停止服务: docker-compose -f docker-compose-wordpress.yml stop"
-        echo -e "启动服务: docker-compose -f docker-compose-wordpress.yml start"
-        echo -e "查看日志: docker-compose -f docker-compose-wordpress.yml logs -f"
+        local compose_cmd
+        compose_cmd=$(get_docker_compose_cmd)
+        echo -e "停止服务: ${compose_cmd} -f docker-compose-wordpress.yml stop"
+        echo -e "启动服务: ${compose_cmd} -f docker-compose-wordpress.yml start"
+        echo -e "查看日志: ${compose_cmd} -f docker-compose-wordpress.yml logs -f"
     else
         echo -e "${RED}WordPress 安装失败${NC}"
     fi
@@ -1203,7 +1525,13 @@ docker_status() {
     
     echo -e "${CYAN}=== Docker 版本 ===${NC}"
     docker --version
-    docker-compose --version
+    if command_exists docker-compose; then
+        docker-compose --version
+    elif command_exists docker && docker compose version >/dev/null 2>&1; then
+        docker compose version
+    else
+        echo -e "${YELLOW}Docker Compose 未安装${NC}"
+    fi
     echo ""
     
     echo -e "${CYAN}=== Docker 系统信息 ===${NC}"
@@ -1335,24 +1663,61 @@ fix_docker_dns() {
     echo -e "${CYAN}选择检测模式:${NC}"
     echo -e "  ${GREEN}1.${NC} 标准检测与修复（推荐）"
     echo -e "  ${GREEN}2.${NC} 高级网络诊断"
+    echo -e "  ${GREEN}3.${NC} DNS污染检测与优化（智能选择最快IP）"
+    echo -e "  ${GREEN}4.${NC} 返回主菜单"
     echo ""
     
-    read -p "请选择模式 (默认1): " mode
+    read -p "请选择模式 (1-4): " mode
     mode=${mode:-1}
     
-    if [ "$mode" = "2" ]; then
-        advanced_dns_diagnostic
-        # 询问是否继续标准修复
-        echo ""
-        read -p "是否继续Docker DNS修复？(y/n, 默认y): " continue_repair
-        continue_repair=${continue_repair:-y}
-        
-        if [[ $continue_repair != "y" && $continue_repair != "Y" ]]; then
-            echo -e "${YELLOW}已返回主菜单${NC}"
-            read -p "按回车键继续..."
+    case $mode in
+        1)
+            # 标准检测与修复
+            standard_docker_dns_repair
+            ;;
+        2)
+            # 高级网络诊断
+            advanced_dns_diagnostic
+            
+            echo ""
+            read -p "是否继续标准修复？(y/n, 默认y): " continue_repair
+            continue_repair=${continue_repair:-y}
+            
+            if [[ $continue_repair == "y" || $continue_repair == "Y" ]]; then
+                echo ""
+                echo -e "${CYAN}继续标准修复流程...${NC}"
+                standard_docker_dns_repair
+            else
+                echo -e "${YELLOW}已返回主菜单${NC}"
+                read -p "按回车键继续..."
+                return
+            fi
+            ;;
+        3)
+            # DNS污染检测与优化（智能选择最快IP）
+            echo ""
+            echo -e "${CYAN}DNS污染检测与优化功能${NC}"
+            echo -e "${YELLOW}注意: 此功能将检测Docker域名的多个IP地址，选择最快的进行优化${NC}"
+            echo ""
+            
+            # 调用DNS污染检测与优化功能
+            dns_pollution_detection_for_docker
+            ;;
+        4)
+            # 返回主菜单
             return
-        fi
-    fi
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            fix_docker_dns
+            ;;
+    esac
+    return
+}
+
+# 标准Docker DNS检测与修复
+standard_docker_dns_repair() {
     
     echo ""
     echo -e "${CYAN}正在检测Docker镜像源域名DNS污染情况...${NC}"
@@ -1653,6 +2018,256 @@ fix_docker_dns() {
     read -p "按回车键返回主菜单..."
 }
 
+# Docker DNS污染检测与优化（智能选择最快IP）
+dns_pollution_detection_for_docker() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}  Docker DNS污染检测与优化${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}功能说明:${NC}"
+    echo -e "1. 检测Docker相关域名的DNS解析情况"
+    echo -e "2. 获取域名的多个IP地址（最多10个）"
+    echo -e "3. 测试每个IP的响应速度和连通性"
+    echo -e "4. 选择最快的IP地址"
+    echo -e "5. 备份原有hosts文件"
+    echo -e "6. 更新hosts配置，优化Docker访问"
+    echo ""
+    
+    echo -e "${CYAN}选择要优化的Docker域名:${NC}"
+    echo -e "  ${GREEN}1.${NC} 所有Docker域名（默认）"
+    echo -e "  ${GREEN}2.${NC} docker.io 主域名"
+    echo -e "  ${GREEN}3.${NC} registry-1.docker.io 镜像仓库"
+    echo -e "  ${GREEN}4.${NC} auth.docker.io 认证服务"
+    echo ""
+    
+    read -p "请选择 (1-4, 默认1): " domain_choice
+    domain_choice=${domain_choice:-1}
+    
+    local target_domains=""
+    case $domain_choice in
+        1)
+            target_domains="$DOCKER_DOMAINS"
+            echo -e "${CYAN}选择: 所有Docker域名${NC}"
+            ;;
+        2)
+            target_domains="docker.io"
+            echo -e "${CYAN}选择: docker.io${NC}"
+            ;;
+        3)
+            target_domains="registry-1.docker.io"
+            echo -e "${CYAN}选择: registry-1.docker.io${NC}"
+            ;;
+        4)
+            target_domains="auth.docker.io"
+            echo -e "${CYAN}选择: auth.docker.io${NC}"
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            read -p "按回车键返回..."
+            dns_pollution_detection_for_docker
+            return
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${CYAN}正在检测域名: ${YELLOW}$target_domains${NC}${CYAN} 的DNS解析...${NC}"
+    echo ""
+    
+    # 从多个DNS服务器获取IP地址
+    local dns_servers=("8.8.8.8" "1.1.1.1" "9.9.9.9" "208.67.222.222" "8.8.4.4")
+    local ip_list=()
+    
+    echo -e "${CYAN}从多个DNS服务器获取IP地址...${NC}"
+    echo ""
+    
+    for dns in "${dns_servers[@]}"; do
+        echo -e "查询DNS服务器: ${YELLOW}$dns${NC}"
+        
+        # 处理多个域名
+        for domain in $target_domains; do
+            local ips=$(dig +short $domain @$dns 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+            
+            if [ -n "$ips" ]; then
+                while IFS= read -r ip; do
+                    if [[ ! " ${ip_list[@]} " =~ " ${ip} " ]]; then
+                        ip_list+=("$ip")
+                        echo -e "  ${GREEN}发现IP: $ip${NC}"
+                    fi
+                done <<< "$ips"
+            fi
+        done
+        echo ""
+    done
+    
+    if [ ${#ip_list[@]} -eq 0 ]; then
+        echo -e "${RED}无法从任何DNS服务器获取IP地址${NC}"
+        echo -e "${YELLOW}可能原因:${NC}"
+        echo -e "1. 网络连接问题"
+        echo -e "2. 域名不存在"
+        echo -e "3. DNS服务器不可用"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo -e "${GREEN}共获取到 ${#ip_list[@]} 个IP地址${NC}"
+    echo ""
+    
+    # 限制最多测试10个IP
+    if [ ${#ip_list[@]} -gt 10 ]; then
+        echo -e "${YELLOW}IP地址过多，只测试前10个${NC}"
+        ip_list=("${ip_list[@]:0:10}")
+    fi
+    
+    echo -e "${CYAN}测试IP地址的响应速度和连通性...${NC}"
+    echo ""
+    
+    local best_ip=""
+    local best_score=-999999
+    
+    # 测试每个IP的性能
+    for ip in "${ip_list[@]}"; do
+        echo -e "测试IP: ${YELLOW}$ip${NC}"
+        
+        local score=0
+        
+        # 1. Ping测试
+        echo -n "  Ping测试: "
+        local ping_result=$(timeout 3 ping -c 2 -W 1 $ip 2>/dev/null | grep "time=" | head -1 | awk -F'time=' '{print $2}' | awk '{print $1}')
+        
+        if [ -n "$ping_result" ]; then
+            # 转换为整数（去掉小数部分）
+            local ping_int=$(echo "$ping_result" | awk -F. '{print $1}')
+            echo -e "${GREEN}${ping_result}ms${NC}"
+            
+            # 延迟越低，分数越高
+            if [ -n "$ping_int" ]; then
+                if [ $ping_int -lt 50 ]; then
+                    score=$((score + 100))
+                elif [ $ping_int -lt 100 ]; then
+                    score=$((score + 80))
+                elif [ $ping_int -lt 200 ]; then
+                    score=$((score + 60))
+                elif [ $ping_int -lt 300 ]; then
+                    score=$((score + 40))
+                else
+                    score=$((score + 20))
+                fi
+            fi
+        else
+            echo -e "${RED}失败${NC}"
+            score=$((score - 50))
+        fi
+        
+        # 2. HTTP测试
+        echo -n "  HTTP测试: "
+        local http_test=$(timeout 5 curl -s -I "http://$ip" 2>&1 | head -1)
+        
+        if [[ "$http_test" == *"200"* ]] || [[ "$http_test" == *"301"* ]] || [[ "$http_test" == *"302"* ]]; then
+            echo -e "${GREEN}正常${NC}"
+            score=$((score + 50))
+        elif [[ "$http_test" == *"curl:"* ]] || [[ "$http_test" == "" ]]; then
+            echo -e "${YELLOW}异常${NC}"
+            score=$((score - 20))
+        else
+            echo -e "${RED}失败${NC}"
+            score=$((score - 50))
+        fi
+        
+        echo -e "  综合得分: ${YELLOW}$score${NC}"
+        echo ""
+        
+        # 更新最佳IP
+        if [ $score -gt $best_score ]; then
+            best_score=$score
+            best_ip=$ip
+        fi
+        
+        sleep 0.5
+    done
+    
+    if [ -z "$best_ip" ]; then
+        echo -e "${RED}所有IP地址测试失败${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo -e "${GREEN}找到最佳IP地址: ${YELLOW}$best_ip${GREEN} (得分: ${best_score})${NC}"
+    echo ""
+    
+    # 备份当前hosts文件
+    local backup_file="/etc/hosts.backup.docker_optimized_$(date +%Y%m%d_%H%M%S)"
+    echo -e "${CYAN}备份当前hosts文件到: ${YELLOW}$backup_file${NC}"
+    cp /etc/hosts "$backup_file"
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}备份失败，请检查权限${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    # 更新hosts文件
+    echo -e "${CYAN}更新hosts文件...${NC}"
+    
+    # 创建临时文件
+    local temp_file=$(mktemp)
+    
+    # 移除旧的对应域名条目
+    for domain in $target_domains; do
+        grep -v "$domain" /etc/hosts > "$temp_file"
+        mv "$temp_file" /etc/hosts
+    done
+    
+    # 添加新的域名条目
+    for domain in $target_domains; do
+        echo "$best_ip $domain" >> /etc/hosts
+    done
+    
+    # 添加注释
+    sed -i "/# Docker domains (optimized)/d" /etc/hosts
+    echo "" >> /etc/hosts
+    echo "# Docker domains (optimized by DNS pollution detection on $(date))" >> /etc/hosts
+    
+    echo -e "${GREEN}hosts文件更新完成！${NC}"
+    echo ""
+    
+    # 刷新DNS缓存
+    echo -e "${CYAN}刷新DNS缓存...${NC}"
+    
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            systemctl restart systemd-resolved 2>/dev/null || systemctl restart NetworkManager 2>/dev/null
+            ;;
+        "ubuntu"|"debian")
+            systemctl restart systemd-resolved 2>/dev/null || /etc/init.d/nscd restart 2>/dev/null
+            ;;
+    esac
+    
+    echo -e "${GREEN}DNS缓存已刷新${NC}"
+    echo ""
+    
+    # 测试修复效果
+    echo -e "${CYAN}测试修复效果...${NC}"
+    
+    local test_domain=$(echo "$target_domains" | awk '{print $1}')  # 取第一个域名测试
+    local test_result=$(dig +short "$test_domain" 2>/dev/null | head -1)
+    
+    if [ "$test_result" = "$best_ip" ]; then
+        echo -e "${GREEN}✓ DNS解析已更新为最佳IP: $best_ip${NC}"
+    else
+        echo -e "${YELLOW}⚠ DNS解析可能未立即生效，需要等待DNS缓存过期${NC}"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}提示:${NC}"
+    echo -e "1. 如果Docker访问仍然有问题，可能需要重启Docker服务"
+    echo -e "2. IP地址可能会变化，建议定期运行此功能"
+    echo -e "3. 原始hosts文件已备份: $backup_file"
+    
+    read -p "按回车键返回..."
+}
+
 # GitHub DNS污染检测与修复
 fix_github_dns() {
     clear
@@ -1664,25 +2279,46 @@ fix_github_dns() {
     echo -e "${CYAN}选择检测模式:${NC}"
     echo -e "  ${GREEN}1.${NC} 标准检测与修复（推荐）"
     echo -e "  ${GREEN}2.${NC} 高级检测与修复（包含网络诊断）"
+    echo -e "  ${GREEN}3.${NC} DNS污染检测与优化（智能选择最快IP）"
+    echo -e "  ${GREEN}4.${NC} 返回主菜单"
     echo ""
     
-    read -p "请选择模式 (默认1): " mode
+    read -p "请选择模式 (1-4): " mode
     mode=${mode:-1}
     
-    if [ "$mode" = "2" ]; then
-        advanced_dns_diagnostic
-        # 询问是否继续标准修复
-        echo ""
-        read -p "是否继续标准DNS修复？(y/n, 默认y): " continue_repair
-        continue_repair=${continue_repair:-y}
-        
-        if [[ $continue_repair != "y" && $continue_repair != "Y" ]]; then
-            echo -e "${YELLOW}已返回主菜单${NC}"
-            read -p "按回车键继续..."
+    case $mode in
+        1)
+            # 标准检测与修复
+            standard_github_dns_repair
+            ;;
+        2)
+            # 高级检测与修复
+            advanced_github_dns_repair
+            ;;
+        3)
+            # DNS污染检测与优化（智能选择最快IP）
+            echo ""
+            echo -e "${CYAN}DNS污染检测与优化功能${NC}"
+            echo -e "${YELLOW}注意: 此功能将检测指定域名的多个IP地址，选择最快的进行优化${NC}"
+            echo ""
+            
+            # 调用DNS污染检测与优化功能
+            dns_pollution_detection
+            ;;
+        4)
+            # 返回主菜单
             return
-        fi
-    fi
-    
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            fix_github_dns
+            ;;
+    esac
+}
+
+# 标准GitHub DNS检测与修复
+standard_github_dns_repair() {
     echo ""
     echo -e "${CYAN}正在检测GitHub域名DNS污染情况...${NC}"
     echo ""
@@ -3144,6 +3780,151 @@ mysql_backup() {
     esac
 }
 
+# 备份数据库结构
+backup_database_structure() {
+    echo -e "${CYAN}备份数据库结构...${NC}"
+    echo ""
+    
+    read -p "请输入MySQL主机地址 (默认: localhost): " db_host
+    db_host=${db_host:-localhost}
+    read -p "请输入MySQL端口 (默认: 3306): " db_port
+    db_port=${db_port:-3306}
+    read -p "请输入MySQL用户名: " db_user
+    read -p "请输入MySQL密码: " -s db_pass
+    echo ""
+    read -p "请输入数据库名称: " db_name
+    read -p "请输入备份文件保存路径 (默认: /opt/backup/mysql): " backup_path
+    backup_path=${backup_path:-/opt/backup/mysql}
+    
+    mkdir -p "$backup_path"
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${backup_path}/${db_name}_structure_${timestamp}.sql"
+    local backup_file_gz="${backup_file}.gz"
+    
+    echo -e "${CYAN}正在备份数据库结构: $db_name${NC}"
+    
+    if [ -n "$db_pass" ]; then
+        mysqldump -h "$db_host" -P "$db_port" -u "$db_user" -p"$db_pass" --no-data "$db_name" > "$backup_file"
+    else
+        mysqldump -h "$db_host" -P "$db_port" -u "$db_user" --no-data "$db_name" > "$backup_file"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ 数据库结构备份成功！${NC}"
+        gzip "$backup_file"
+        local file_size=$(du -h "$backup_file_gz" | awk '{print $1}')
+        echo -e "${CYAN}备份信息:${NC}"
+        echo -e "  数据库: $db_name"
+        echo -e "  备份文件: $backup_file_gz"
+        echo -e "  文件大小: $file_size"
+    else
+        echo -e "${RED}✗ 数据库结构备份失败${NC}"
+    fi
+    
+    echo ""
+    read -p "按回车键返回MySQL备份菜单..."
+    mysql_backup
+}
+
+# 备份数据库数据
+backup_database_data() {
+    echo -e "${CYAN}备份数据库数据...${NC}"
+    echo ""
+    
+    read -p "请输入MySQL主机地址 (默认: localhost): " db_host
+    db_host=${db_host:-localhost}
+    read -p "请输入MySQL端口 (默认: 3306): " db_port
+    db_port=${db_port:-3306}
+    read -p "请输入MySQL用户名: " db_user
+    read -p "请输入MySQL密码: " -s db_pass
+    echo ""
+    read -p "请输入数据库名称: " db_name
+    read -p "请输入备份文件保存路径 (默认: /opt/backup/mysql): " backup_path
+    backup_path=${backup_path:-/opt/backup/mysql}
+    
+    mkdir -p "$backup_path"
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_file="${backup_path}/${db_name}_data_${timestamp}.sql"
+    local backup_file_gz="${backup_file}.gz"
+    
+    echo -e "${CYAN}正在备份数据库数据: $db_name${NC}"
+    
+    if [ -n "$db_pass" ]; then
+        mysqldump -h "$db_host" -P "$db_port" -u "$db_user" -p"$db_pass" --no-create-info "$db_name" > "$backup_file"
+    else
+        mysqldump -h "$db_host" -P "$db_port" -u "$db_user" --no-create-info "$db_name" > "$backup_file"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ 数据库数据备份成功！${NC}"
+        gzip "$backup_file"
+        local file_size=$(du -h "$backup_file_gz" | awk '{print $1}')
+        echo -e "${CYAN}备份信息:${NC}"
+        echo -e "  数据库: $db_name"
+        echo -e "  备份文件: $backup_file_gz"
+        echo -e "  文件大小: $file_size"
+    else
+        echo -e "${RED}✗ 数据库数据备份失败${NC}"
+    fi
+    
+    echo ""
+    read -p "按回车键返回MySQL备份菜单..."
+    mysql_backup
+}
+
+# MongoDB备份
+mongodb_backup() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          MongoDB 备份${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    if ! command -v mongodump &> /dev/null; then
+        echo -e "${YELLOW}MongoDB客户端未安装${NC}"
+        read -p "按回车键返回..."
+        database_backup
+        return
+    fi
+    
+    read -p "请输入MongoDB连接URI (默认: mongodb://localhost:27017): " mongo_uri
+    mongo_uri=${mongo_uri:-mongodb://localhost:27017}
+    read -p "请输入数据库名称 (留空备份所有): " mongo_db
+    read -p "请输入备份文件保存路径 (默认: /opt/backup/mongodb): " backup_path
+    backup_path=${backup_path:-/opt/backup/mongodb}
+    
+    mkdir -p "$backup_path"
+    
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_dir="${backup_path}/mongodb_${timestamp}"
+    
+    echo -e "${CYAN}正在备份MongoDB数据库...${NC}"
+    
+    if [ -n "$mongo_db" ]; then
+        mongodump --uri="$mongo_uri" --db="$mongo_db" --out="$backup_dir" 2>/dev/null
+    else
+        mongodump --uri="$mongo_uri" --out="$backup_dir" 2>/dev/null
+    fi
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}✓ MongoDB备份成功！${NC}"
+        tar -czf "${backup_dir}.tar.gz" -C "$backup_path" "mongodb_${timestamp}" 2>/dev/null
+        rm -rf "$backup_dir"
+        local file_size=$(du -h "${backup_dir}.tar.gz" | awk '{print $1}')
+        echo -e "${CYAN}备份信息:${NC}"
+        echo -e "  备份文件: ${backup_dir}.tar.gz"
+        echo -e "  文件大小: $file_size"
+    else
+        echo -e "${RED}✗ MongoDB备份失败${NC}"
+    fi
+    
+    echo ""
+    read -p "按回车键返回数据库备份菜单..."
+    database_backup
+}
+
 # 备份单个数据库
 backup_single_database() {
     echo -e "${CYAN}备份单个数据库...${NC}"
@@ -3511,44 +4292,529 @@ configure_backup_schedule() {
     echo -e "${PURPLE}          配置定时备份任务${NC}"
     echo -e "${PURPLE}========================================${NC}"
     echo ""
-    
-    echo -e "${CYAN}选择定时任务类型:${NC}"
-    echo -e "  ${GREEN}1.${NC} 配置MySQL定时备份"
-    echo -e "  ${GREEN}2.${NC} 配置PostgreSQL定时备份"
-    echo -e "  ${GREEN}3.${NC} 配置Redis定时备份"
-    echo -e "  ${GREEN}4.${NC} 查看当前定时任务"
-    echo -e "  ${GREEN}5.${NC} 删除定时任务"
+    echo -e "${YELLOW}已升级为定时任务中心，请从新的菜单入口管理${NC}"
+    echo ""
+    pause "按回车键进入定时任务中心..."
+    cron_task_center
+}
+
+# 定时任务中心
+cron_task_center() {
+    init_cron_env
+
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          定时任务中心${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}选择功能:${NC}"
+        echo -e "  ${GREEN}1.${NC} 新增备份任务"
+        echo -e "  ${GREEN}2.${NC} 查看任务列表"
+        echo -e "  ${GREEN}3.${NC} 启用/停用任务"
+        echo -e "  ${GREEN}4.${NC} 删除任务"
+        echo -e "  ${GREEN}5.${NC} 查看任务日志"
+        echo -e "  ${GREEN}6.${NC} 返回上一级"
+        echo ""
+
+        read -p "请选择操作 (1-6): " cron_choice
+
+        case $cron_choice in
+            1)
+                create_backup_task
+                ;;
+            2)
+                list_cron_tasks
+                ;;
+            3)
+                toggle_cron_task
+                ;;
+            4)
+                delete_cron_task
+                ;;
+            5)
+                view_cron_task_logs
+                ;;
+            6)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+create_backup_task() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          新增备份任务${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+
+    echo -e "${CYAN}选择备份类型:${NC}"
+    echo -e "  ${GREEN}1.${NC} MySQL/MariaDB"
+    echo -e "  ${GREEN}2.${NC} PostgreSQL"
+    echo -e "  ${GREEN}3.${NC} Redis"
+    echo -e "  ${GREEN}4.${NC} 目录打包"
+    echo -e "  ${GREEN}5.${NC} Docker 卷备份"
     echo -e "  ${GREEN}6.${NC} 返回上一级"
     echo ""
-    
-    read -p "请选择操作 (1-6): " schedule_choice
-    
-    case $schedule_choice in
+
+    read -p "请选择类型 (1-6): " backup_choice
+
+    case $backup_choice in
         1)
-            configure_mysql_schedule
+            create_mysql_backup_task
             ;;
         2)
-            configure_postgresql_schedule
+            create_postgresql_backup_task
             ;;
         3)
-            configure_redis_schedule
+            create_redis_backup_task
             ;;
         4)
-            view_cron_jobs
+            create_directory_backup_task
             ;;
         5)
-            delete_cron_job
+            create_docker_volume_backup_task
             ;;
         6)
-            database_backup
             return
             ;;
         *)
             echo -e "${RED}无效的选择${NC}"
             sleep 2
-            configure_backup_schedule
+            create_backup_task
             ;;
     esac
+}
+
+prompt_cron_expr() {
+    local cron_expr
+    while true; do
+        read -p "请输入cron表达式 (例如: 0 2 * * *): " cron_expr
+        if validate_cron_expr "$cron_expr"; then
+            echo "$cron_expr"
+            return
+        fi
+        echo -e "${RED}cron表达式格式不正确，请重新输入${NC}"
+    done
+}
+
+create_mysql_backup_task() {
+    echo ""
+    echo -e "${YELLOW}提示: 密码将写入任务脚本，请妥善保管服务器权限${NC}"
+    read -p "MySQL主机 (默认: localhost): " db_host
+    db_host=${db_host:-localhost}
+    read -p "MySQL端口 (默认: 3306): " db_port
+    db_port=${db_port:-3306}
+    read -p "MySQL用户名: " db_user
+    read -p "MySQL密码: " -s db_pass
+    echo ""
+    read -p "数据库名称(留空表示所有数据库): " db_name
+    read -p "备份目录 (默认: /opt/backup/mysql): " backup_path
+    backup_path=${backup_path:-/opt/backup/mysql}
+    read -p "保留天数 (默认: 7): " retention_days
+    retention_days=${retention_days:-7}
+
+    local cron_expr
+    cron_expr=$(prompt_cron_expr)
+
+    local task_id="mysql_backup_$(date +%Y%m%d_%H%M%S)"
+    local script_path="$CRON_TASK_DIR/${task_id}.sh"
+    local task_desc="MySQL定时备份"
+
+    cat > "$script_path" << EOF
+#!/bin/bash
+set -e
+
+BACKUP_DIR="$backup_path"
+DB_HOST="$db_host"
+DB_PORT="$db_port"
+DB_USER="$db_user"
+DB_PASS="$db_pass"
+DB_NAME="$db_name"
+RETENTION_DAYS="$retention_days"
+
+if ! command -v mysqldump >/dev/null 2>&1; then
+    echo "mysqldump 未安装"
+    exit 1
+fi
+
+mkdir -p "$backup_path"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+if [ -z "$DB_NAME" ]; then
+    BACKUP_FILE="$backup_path/all_databases_$TIMESTAMP.sql"
+    mysqldump -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" --all-databases > "$BACKUP_FILE"
+else
+    BACKUP_FILE="$backup_path/${DB_NAME}_$TIMESTAMP.sql"
+    mysqldump -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" > "$BACKUP_FILE"
+fi
+
+gzip "$BACKUP_FILE"
+find "$backup_path" -type f -name "*.sql.gz" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
+EOF
+
+    chmod 700 "$script_path"
+    add_task_registry "$task_id" "$task_desc" "$cron_expr" "/bin/bash $script_path" "enabled"
+    render_cron_file
+    echo -e "${GREEN}✓ MySQL定时备份任务已创建${NC}"
+    pause
+}
+
+create_postgresql_backup_task() {
+    echo ""
+    echo -e "${YELLOW}提示: 密码将写入任务脚本，请妥善保管服务器权限${NC}"
+    read -p "PostgreSQL主机 (默认: localhost): " db_host
+    db_host=${db_host:-localhost}
+    read -p "PostgreSQL端口 (默认: 5432): " db_port
+    db_port=${db_port:-5432}
+    read -p "PostgreSQL用户名: " db_user
+    read -p "PostgreSQL密码: " -s db_pass
+    echo ""
+    read -p "数据库名称(留空表示全部): " db_name
+    read -p "备份目录 (默认: /opt/backup/postgresql): " backup_path
+    backup_path=${backup_path:-/opt/backup/postgresql}
+    read -p "保留天数 (默认: 7): " retention_days
+    retention_days=${retention_days:-7}
+
+    local cron_expr
+    cron_expr=$(prompt_cron_expr)
+
+    local task_id="postgres_backup_$(date +%Y%m%d_%H%M%S)"
+    local script_path="$CRON_TASK_DIR/${task_id}.sh"
+    local task_desc="PostgreSQL定时备份"
+
+    cat > "$script_path" << EOF
+#!/bin/bash
+set -e
+
+BACKUP_DIR="$backup_path"
+DB_HOST="$db_host"
+DB_PORT="$db_port"
+DB_USER="$db_user"
+DB_PASS="$db_pass"
+DB_NAME="$db_name"
+RETENTION_DAYS="$retention_days"
+
+if ! command -v pg_dump >/dev/null 2>&1; then
+    echo "pg_dump 未安装"
+    exit 1
+fi
+
+mkdir -p "$backup_path"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+export PGPASSWORD="$DB_PASS"
+
+if [ -z "$DB_NAME" ]; then
+    BACKUP_FILE="$backup_path/all_databases_$TIMESTAMP.sql"
+    pg_dumpall -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" > "$BACKUP_FILE"
+else
+    BACKUP_FILE="$backup_path/${DB_NAME}_$TIMESTAMP.sql"
+    pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$BACKUP_FILE"
+fi
+
+gzip "$BACKUP_FILE"
+unset PGPASSWORD
+find "$backup_path" -type f -name "*.sql.gz" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
+EOF
+
+    chmod 700 "$script_path"
+    add_task_registry "$task_id" "$task_desc" "$cron_expr" "/bin/bash $script_path" "enabled"
+    render_cron_file
+    echo -e "${GREEN}✓ PostgreSQL定时备份任务已创建${NC}"
+    pause
+}
+
+create_redis_backup_task() {
+    echo ""
+    read -p "Redis主机 (默认: localhost): " redis_host
+    redis_host=${redis_host:-localhost}
+    read -p "Redis端口 (默认: 6379): " redis_port
+    redis_port=${redis_port:-6379}
+    read -p "Redis密码 (留空无密码): " -s redis_pass
+    echo ""
+    read -p "备份目录 (默认: /opt/backup/redis): " backup_path
+    backup_path=${backup_path:-/opt/backup/redis}
+    read -p "保留天数 (默认: 7): " retention_days
+    retention_days=${retention_days:-7}
+
+    local cron_expr
+    cron_expr=$(prompt_cron_expr)
+
+    local task_id="redis_backup_$(date +%Y%m%d_%H%M%S)"
+    local script_path="$CRON_TASK_DIR/${task_id}.sh"
+    local task_desc="Redis定时备份"
+
+    cat > "$script_path" << EOF
+#!/bin/bash
+set -e
+
+BACKUP_DIR="$backup_path"
+REDIS_HOST="$redis_host"
+REDIS_PORT="$redis_port"
+REDIS_PASS="$redis_pass"
+RETENTION_DAYS="$retention_days"
+
+if ! command -v redis-cli >/dev/null 2>&1; then
+    echo "redis-cli 未安装"
+    exit 1
+fi
+
+mkdir -p "$backup_path"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$backup_path/redis_dump_$TIMESTAMP.rdb"
+
+if [ -n "$REDIS_PASS" ]; then
+    redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" -a "$REDIS_PASS" --rdb "$BACKUP_FILE" > /dev/null 2>&1
+else
+    redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" --rdb "$BACKUP_FILE" > /dev/null 2>&1
+fi
+
+find "$backup_path" -type f -name "*.rdb" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
+EOF
+
+    chmod 700 "$script_path"
+    add_task_registry "$task_id" "$task_desc" "$cron_expr" "/bin/bash $script_path" "enabled"
+    render_cron_file
+    echo -e "${GREEN}✓ Redis定时备份任务已创建${NC}"
+    pause
+}
+
+create_directory_backup_task() {
+    echo ""
+    read -p "请输入要备份的目录路径: " source_dir
+    if [ -z "$source_dir" ] || [ ! -d "$source_dir" ]; then
+        echo -e "${RED}目录不存在${NC}"
+        pause
+        return
+    fi
+    read -p "备份目录 (默认: /opt/backup/dir): " backup_path
+    backup_path=${backup_path:-/opt/backup/dir}
+    read -p "保留天数 (默认: 7): " retention_days
+    retention_days=${retention_days:-7}
+
+    local cron_expr
+    cron_expr=$(prompt_cron_expr)
+
+    local task_id="dir_backup_$(date +%Y%m%d_%H%M%S)"
+    local script_path="$CRON_TASK_DIR/${task_id}.sh"
+    local task_desc="目录定时备份"
+
+    cat > "$script_path" << EOF
+#!/bin/bash
+set -e
+
+SRC_DIR="$source_dir"
+BACKUP_DIR="$backup_path"
+RETENTION_DAYS="$retention_days"
+
+mkdir -p "$backup_path"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$backup_path/dir_backup_$TIMESTAMP.tar.gz"
+
+tar -czf "$BACKUP_FILE" -C "$source_dir" .
+find "$backup_path" -type f -name "*.tar.gz" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
+EOF
+
+    chmod 700 "$script_path"
+    add_task_registry "$task_id" "$task_desc" "$cron_expr" "/bin/bash $script_path" "enabled"
+    render_cron_file
+    echo -e "${GREEN}✓ 目录定时备份任务已创建${NC}"
+    pause
+}
+
+create_docker_volume_backup_task() {
+    if ! command_exists docker; then
+        echo -e "${RED}Docker 未安装，无法创建卷备份任务${NC}"
+        pause
+        return
+    fi
+
+    echo ""
+    read -p "请输入Docker卷名称: " volume_name
+    if [ -z "$volume_name" ]; then
+        echo -e "${RED}卷名称不能为空${NC}"
+        pause
+        return
+    fi
+    read -p "备份目录 (默认: /opt/backup/docker_volumes): " backup_path
+    backup_path=${backup_path:-/opt/backup/docker_volumes}
+    read -p "保留天数 (默认: 7): " retention_days
+    retention_days=${retention_days:-7}
+
+    local cron_expr
+    cron_expr=$(prompt_cron_expr)
+
+    local task_id="docker_volume_backup_$(date +%Y%m%d_%H%M%S)"
+    local script_path="$CRON_TASK_DIR/${task_id}.sh"
+    local task_desc="Docker卷定时备份"
+
+    cat > "$script_path" << EOF
+#!/bin/bash
+set -e
+
+VOLUME_NAME="$volume_name"
+BACKUP_DIR="$backup_path"
+RETENTION_DAYS="$retention_days"
+
+mkdir -p "$backup_path"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$backup_path/${volume_name}_$TIMESTAMP.tar.gz"
+
+docker run --rm -v "$volume_name":/data -v "$backup_path":/backup alpine \
+    tar -czf "/backup/${volume_name}_$TIMESTAMP.tar.gz" -C /data .
+
+find "$backup_path" -type f -name "${volume_name}_*.tar.gz" -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
+EOF
+
+    chmod 700 "$script_path"
+    add_task_registry "$task_id" "$task_desc" "$cron_expr" "/bin/bash $script_path" "enabled"
+    render_cron_file
+    echo -e "${GREEN}✓ Docker卷定时备份任务已创建${NC}"
+    pause
+}
+
+list_cron_tasks() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          定时任务列表${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+
+    if [ ! -s "$CRON_TASK_REGISTRY" ]; then
+        echo -e "${YELLOW}暂无任务${NC}"
+        pause
+        return
+    fi
+
+    local idx=1
+    while IFS='|' read -r task_id task_desc task_schedule task_cmd task_status; do
+        [ -z "$task_id" ] && continue
+        echo -e "${GREEN}${idx}.${NC} ${task_desc} | ${task_schedule} | ${task_status} | ${task_id}"
+        idx=$((idx + 1))
+    done < "$CRON_TASK_REGISTRY"
+
+    echo ""
+    pause
+}
+
+select_task_id() {
+    local selection
+    local idx=1
+    local chosen_id=""
+
+    if [ ! -s "$CRON_TASK_REGISTRY" ]; then
+        echo ""
+        return
+    fi
+
+    while IFS='|' read -r task_id task_desc task_schedule task_cmd task_status; do
+        [ -z "$task_id" ] && continue
+        echo -e "${GREEN}${idx}.${NC} ${task_desc} | ${task_schedule} | ${task_status}"
+        idx=$((idx + 1))
+    done < "$CRON_TASK_REGISTRY"
+
+    echo ""
+    read -p "请输入任务编号: " selection
+    idx=1
+    while IFS='|' read -r task_id task_desc task_schedule task_cmd task_status; do
+        [ -z "$task_id" ] && continue
+        if [ "$idx" = "$selection" ]; then
+            chosen_id="$task_id"
+            break
+        fi
+        idx=$((idx + 1))
+    done < "$CRON_TASK_REGISTRY"
+
+    echo "$chosen_id"
+}
+
+toggle_cron_task() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          启用/停用任务${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+
+    local task_id
+    task_id=$(select_task_id)
+    if [ -z "$task_id" ]; then
+        echo -e "${YELLOW}未选择有效任务${NC}"
+        pause
+        return
+    fi
+
+    local current_status=""
+    while IFS='|' read -r id desc schedule cmd status; do
+        [ "$id" = "$task_id" ] && current_status="$status"
+    done < "$CRON_TASK_REGISTRY"
+
+    if [ "$current_status" = "disabled" ]; then
+        update_task_status "$task_id" "enabled"
+        echo -e "${GREEN}✓ 已启用任务${NC}"
+    else
+        update_task_status "$task_id" "disabled"
+        echo -e "${YELLOW}✓ 已停用任务${NC}"
+    fi
+
+    render_cron_file
+    pause
+}
+
+delete_cron_task() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          删除任务${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+
+    local task_id
+    task_id=$(select_task_id)
+    if [ -z "$task_id" ]; then
+        echo -e "${YELLOW}未选择有效任务${NC}"
+        pause
+        return
+    fi
+
+    remove_task_registry "$task_id"
+    rm -f "$CRON_TASK_DIR/$task_id.sh"
+    render_cron_file
+    echo -e "${GREEN}✓ 任务已删除${NC}"
+    pause
+}
+
+view_cron_task_logs() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          查看任务日志${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+
+    local task_id
+    task_id=$(select_task_id)
+    if [ -z "$task_id" ]; then
+        echo -e "${YELLOW}未选择有效任务${NC}"
+        pause
+        return
+    fi
+
+    local log_file="$CRON_LOG_DIR/$task_id.log"
+    if [ ! -f "$log_file" ]; then
+        echo -e "${YELLOW}暂无日志文件: $log_file${NC}"
+        pause
+        return
+    fi
+
+    echo -e "${CYAN}日志文件: $log_file${NC}"
+    echo -e "${YELLOW}显示最近50行日志${NC}"
+    echo ""
+    tail -n 50 "$log_file"
+    echo ""
+    pause
 }
 
 # 查看备份历史
@@ -3602,6 +4868,470 @@ view_backup_history() {
     esac
 }
 
+# 时间校准功能
+time_sync() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          时间校准功能${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}当前系统时间:${NC}"
+    echo -e "  系统时间: $(date)"
+    echo -e "  UTC时间: $(date -u)"
+    echo -e "  RTC时间: $(hwclock --show 2>/dev/null || echo "未获取到硬件时钟")"
+    echo ""
+    
+    echo -e "${CYAN}时间校准选项:${NC}"
+    echo -e "  ${GREEN}1.${NC} 手动设置时间（输入日期和时间）"
+    echo -e "  ${GREEN}2.${NC} 自动校准（使用NTP服务器）"
+    echo -e "  ${GREEN}3.${NC} 安装和配置NTP/Chrony服务"
+    echo -e "  ${GREEN}4.${NC} 查看和设置时区"
+    echo -e "  ${GREEN}5.${NC} 同步硬件时钟"
+    echo -e "  ${GREEN}6.${NC} 返回主菜单"
+    echo ""
+    
+    read -p "请选择操作 (1-6): " time_choice
+    
+    case $time_choice in
+        1)
+            # 手动设置时间
+            echo ""
+            echo -e "${CYAN}手动设置系统时间${NC}"
+            echo -e "${YELLOW}格式: YYYY-MM-DD HH:MM:SS${NC}"
+            echo ""
+            
+            read -p "请输入日期和时间 (如: 2026-03-23 15:30:00): " manual_time
+            
+            if [[ "$manual_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+                echo -e "${CYAN}正在设置时间: $manual_time${NC}"
+                
+                # 尝试设置系统时间
+                if date -s "$manual_time" > /dev/null 2>&1; then
+                    echo -e "${GREEN}✓ 系统时间设置成功${NC}"
+                    echo -e "${CYAN}新的系统时间: $(date)${NC}"
+                    
+                    # 询问是否同步硬件时钟
+                    read -p "是否同步硬件时钟？(y/n): " sync_hw
+                    if [[ $sync_hw == "y" || $sync_hw == "Y" ]]; then
+                        hwclock --systohc 2>/dev/null
+                        echo -e "${GREEN}✓ 硬件时钟已同步${NC}"
+                    fi
+                else
+                    echo -e "${RED}✗ 时间设置失败，请检查权限和格式${NC}"
+                fi
+            else
+                echo -e "${RED}✗ 时间格式错误，请使用格式: YYYY-MM-DD HH:MM:SS${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            time_sync
+            ;;
+        2)
+            # 自动校准
+            echo ""
+            echo -e "${CYAN}自动时间校准${NC}"
+            echo ""
+            
+            # 检查可用的NTP客户端
+            local ntp_client=""
+            if command -v ntpdate >/dev/null 2>&1; then
+                ntp_client="ntpdate"
+            elif command -v chronyc >/dev/null 2>&1; then
+                ntp_client="chronyc"
+            else
+                echo -e "${YELLOW}未找到NTP客户端，请先安装NTP服务${NC}"
+                read -p "按回车键继续..."
+                time_sync
+                return
+            fi
+            
+            # NTP服务器列表
+            local ntp_servers=(
+                "time1.cloud.tencent.com"
+                "time2.cloud.tencent.com"
+                "ntp.aliyun.com"
+                "cn.pool.ntp.org"
+                "time.windows.com"
+                "pool.ntp.org"
+            )
+            
+            echo -e "${CYAN}正在测试NTP服务器...${NC}"
+            echo ""
+            
+            local best_server=""
+            local best_time=999
+            
+            for server in "${ntp_servers[@]}"; do
+                echo -n "测试服务器: $server "
+                
+                # 测试延迟
+                local start_time=$(date +%s.%N)
+                if ping -c 1 -W 2 "$server" >/dev/null 2>&1; then
+                    local end_time=$(date +%s.%N)
+                    local response_time=$(echo "$end_time - $start_time" | bc)
+                    
+                    echo -e "延迟: ${GREEN}${response_time}s${NC}"
+                    
+                    if (( $(echo "$response_time < $best_time" | bc -l) )); then
+                        best_time=$response_time
+                        best_server=$server
+                    fi
+                else
+                    echo -e "${RED}不可用${NC}"
+                fi
+            done
+            
+            if [ -n "$best_server" ]; then
+                echo ""
+                echo -e "${CYAN}选择最佳服务器: ${YELLOW}$best_server${NC} (延迟: ${best_time}s)"
+                
+                echo -e "${CYAN}校准前时间: $(date)${NC}"
+                
+                # 执行时间校准
+                if [ "$ntp_client" = "ntpdate" ]; then
+                    ntpdate -u "$best_server" >/dev/null 2>&1
+                elif [ "$ntp_client" = "chronyc" ]; then
+                    chronyc -a "server $best_server iburst" >/dev/null 2>&1
+                    chronyc -a makestep >/dev/null 2>&1
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ 时间校准成功${NC}"
+                    echo -e "${CYAN}校准后时间: $(date)${NC}"
+                    
+                    # 同步硬件时钟
+                    hwclock --systohc 2>/dev/null
+                    echo -e "${GREEN}✓ 硬件时钟已同步${NC}"
+                else
+                    echo -e "${RED}✗ 时间校准失败${NC}"
+                fi
+            else
+                echo -e "${RED}✗ 所有NTP服务器都不可用${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            time_sync
+            ;;
+        3)
+            # 安装和配置NTP/Chrony服务
+            echo ""
+            echo -e "${CYAN}安装和配置时间同步服务${NC}"
+            echo ""
+            
+            echo -e "${CYAN}选择时间同步服务:${NC}"
+            echo -e "  ${GREEN}1.${NC} Chrony（推荐）"
+            echo -e "  ${GREEN}2.${NC} NTP（传统）"
+            echo -e "  ${GREEN}3.${NC} 返回上一级"
+            echo ""
+            
+            read -p "请选择 (1-3): " service_choice
+            
+            case $service_choice in
+                1)
+                    # 安装Chrony
+                    echo -e "${CYAN}正在安装Chrony...${NC}"
+                    
+                    case $DISTRO in
+                        "ubuntu"|"debian")
+                            apt update
+                            apt install -y chrony
+                            ;;
+                        "centos"|"rhel")
+                            yum install -y chrony
+                            ;;
+                        *)
+                            echo -e "${RED}不支持的系统: $DISTRO${NC}"
+                            read -p "按回车键继续..."
+                            time_sync
+                            return
+                            ;;
+                    esac
+                    
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ Chrony安装成功${NC}"
+                        
+                        # 配置Chrony
+                        echo -e "${CYAN}正在配置Chrony...${NC}"
+                        
+                        # 备份原始配置
+                        cp /etc/chrony/chrony.conf /etc/chrony/chrony.conf.backup 2>/dev/null
+                        cp /etc/chrony.conf /etc/chrony.conf.backup 2>/dev/null
+                        
+                        # 创建优化配置
+                        cat > /tmp/chrony.conf << EOF
+# 优化的Chrony配置
+server time1.cloud.tencent.com iburst
+server time2.cloud.tencent.com iburst
+server ntp.aliyun.com iburst
+server cn.pool.ntp.org iburst
+
+# 允许其他主机同步
+allow 192.168.0.0/16
+allow 10.0.0.0/8
+allow 172.16.0.0/12
+
+# 本地时钟源
+local stratum 10
+
+# 时间同步设置
+makestep 1.0 3
+rtcsync
+EOF
+                        
+                        # 应用配置
+                        if [ -f /etc/chrony/chrony.conf ]; then
+                            cp /tmp/chrony.conf /etc/chrony/chrony.conf
+                        elif [ -f /etc/chrony.conf ]; then
+                            cp /tmp/chrony.conf /etc/chrony.conf
+                        fi
+                        
+                        # 启动服务
+                        systemctl enable chronyd
+                        systemctl restart chronyd
+                        
+                        if [ $? -eq 0 ]; then
+                            echo -e "${GREEN}✓ Chrony配置完成并启动成功${NC}"
+                        else
+                            echo -e "${YELLOW}⚠ Chrony启动失败，请手动检查${NC}"
+                        fi
+                    else
+                        echo -e "${RED}✗ Chrony安装失败${NC}"
+                    fi
+                    ;;
+                2)
+                    # 安装NTP
+                    echo -e "${CYAN}正在安装NTP...${NC}"
+                    
+                    case $DISTRO in
+                        "ubuntu"|"debian")
+                            apt update
+                            apt install -y ntp ntpdate
+                            ;;
+                        "centos"|"rhel")
+                            yum install -y ntp ntpdate
+                            ;;
+                        *)
+                            echo -e "${RED}不支持的系统: $DISTRO${NC}"
+                            read -p "按回车键继续..."
+                            time_sync
+                            return
+                            ;;
+                    esac
+                    
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ NTP安装成功${NC}"
+                        
+                        # 配置NTP
+                        echo -e "${CYAN}正在配置NTP...${NC}"
+                        
+                        # 备份原始配置
+                        cp /etc/ntp.conf /etc/ntp.conf.backup
+                        
+                        # 创建优化配置
+                        cat > /tmp/ntp.conf << EOF
+# 优化的NTP配置
+server time1.cloud.tencent.com iburst
+server time2.cloud.tencent.com iburst
+server ntp.aliyun.com iburst
+server cn.pool.ntp.org iburst
+
+# 允许其他主机同步
+restrict 192.168.0.0 mask 255.255.0.0 nomodify notrap
+restrict 10.0.0.0 mask 255.0.0.0 nomodify notrap
+restrict 172.16.0.0 mask 255.240.0.0 nomodify notrap
+
+# 本地时钟源
+server 127.127.1.0
+fudge 127.127.1.0 stratum 10
+EOF
+                        
+                        # 应用配置
+                        cp /tmp/ntp.conf /etc/ntp.conf
+                        
+                        # 启动服务
+                        systemctl enable ntpd
+                        systemctl restart ntpd
+                        
+                        if [ $? -eq 0 ]; then
+                            echo -e "${GREEN}✓ NTP配置完成并启动成功${NC}"
+                        else
+                            echo -e "${YELLOW}⚠ NTP启动失败，请手动检查${NC}"
+                        fi
+                    else
+                        echo -e "${RED}✗ NTP安装失败${NC}"
+                    fi
+                    ;;
+                3)
+                    time_sync
+                    return
+                    ;;
+                *)
+                    echo -e "${RED}无效的选择${NC}"
+                    sleep 2
+                    time_sync
+                    return
+                    ;;
+            esac
+            
+            read -p "按回车键继续..."
+            time_sync
+            ;;
+        4)
+            # 查看和设置时区
+            echo ""
+            echo -e "${CYAN}时区管理${NC}"
+            echo ""
+            
+            echo -e "${CYAN}当前时区信息:${NC}"
+            timedatectl status
+            echo ""
+            
+            echo -e "${CYAN}可用时区选项:${NC}"
+            echo -e "  ${GREEN}1.${NC} 查看所有时区"
+            echo -e "  ${GREEN}2.${NC} 设置为上海时区（Asia/Shanghai）"
+            echo -e "  ${GREEN}3.${NC} 设置为UTC时区"
+            echo -e "  ${GREEN}4.${NC} 手动选择时区"
+            echo -e "  ${GREEN}5.${NC} 返回上一级"
+            echo ""
+            
+            read -p "请选择操作 (1-5): " timezone_choice
+            
+            case $timezone_choice in
+                1)
+                    echo -e "${CYAN}正在列出常用时区...${NC}"
+                    echo ""
+                    echo "亚洲时区:"
+                    echo "  Asia/Shanghai    - 中国上海"
+                    echo "  Asia/Tokyo       - 日本东京"
+                    echo "  Asia/Seoul       - 韩国首尔"
+                    echo "  Asia/Singapore   - 新加坡"
+                    echo ""
+                    echo "欧洲时区:"
+                    echo "  Europe/London    - 英国伦敦"
+                    echo "  Europe/Paris     - 法国巴黎"
+                    echo "  Europe/Berlin    - 德国柏林"
+                    echo ""
+                    echo "北美时区:"
+                    echo "  America/New_York - 美国纽约"
+                    echo "  America/Chicago  - 美国芝加哥"
+                    echo "  America/Los_Angeles - 美国洛杉矶"
+                    echo ""
+                    ;;
+                2)
+                    echo -e "${CYAN}正在设置时区为 Asia/Shanghai...${NC}"
+                    timedatectl set-timezone Asia/Shanghai
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ 时区设置成功${NC}"
+                        echo -e "${CYAN}当前时间: $(date)${NC}"
+                    else
+                        echo -e "${RED}✗ 时区设置失败${NC}"
+                    fi
+                    ;;
+                3)
+                    echo -e "${CYAN}正在设置时区为 UTC...${NC}"
+                    timedatectl set-timezone UTC
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ 时区设置成功${NC}"
+                        echo -e "${CYAN}当前时间: $(date)${NC}"
+                    else
+                        echo -e "${RED}✗ 时区设置失败${NC}"
+                    fi
+                    ;;
+                4)
+                    echo -e "${CYAN}请手动输入时区（如: Asia/Shanghai）${NC}"
+                    read -p "请输入时区: " custom_timezone
+                    
+                    if [ -n "$custom_timezone" ]; then
+                        echo -e "${CYAN}正在设置时区为 $custom_timezone...${NC}"
+                        timedatectl set-timezone "$custom_timezone"
+                        
+                        if [ $? -eq 0 ]; then
+                            echo -e "${GREEN}✓ 时区设置成功${NC}"
+                            echo -e "${CYAN}当前时间: $(date)${NC}"
+                        else
+                            echo -e "${RED}✗ 时区设置失败，请检查时区名称${NC}"
+                        fi
+                    else
+                        echo -e "${RED}✗ 时区不能为空${NC}"
+                    fi
+                    ;;
+                5)
+                    time_sync
+                    return
+                    ;;
+                *)
+                    echo -e "${RED}无效的选择${NC}"
+                    ;;
+            esac
+            
+            read -p "按回车键继续..."
+            time_sync
+            ;;
+        5)
+            # 同步硬件时钟
+            echo ""
+            echo -e "${CYAN}同步硬件时钟${NC}"
+            echo ""
+            
+            echo -e "${CYAN}当前系统时间: $(date)${NC}"
+            echo -e "${CYAN}当前硬件时钟: $(hwclock --show 2>/dev/null || echo "无法读取")${NC}"
+            echo ""
+            
+            echo -e "${CYAN}选择同步方向:${NC}"
+            echo -e "  ${GREEN}1.${NC} 系统时间 → 硬件时钟（推荐）"
+            echo -e "  ${GREEN}2.${NC} 硬件时钟 → 系统时间"
+            echo -e "  ${GREEN}3.${NC} 返回上一级"
+            echo ""
+            
+            read -p "请选择 (1-3): " hw_sync_choice
+            
+            case $hw_sync_choice in
+                1)
+                    echo -e "${CYAN}正在将系统时间同步到硬件时钟...${NC}"
+                    hwclock --systohc
+                    
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ 硬件时钟同步成功${NC}"
+                    else
+                        echo -e "${RED}✗ 硬件时钟同步失败${NC}"
+                    fi
+                    ;;
+                2)
+                    echo -e "${CYAN}正在将硬件时钟同步到系统时间...${NC}"
+                    hwclock --hctosys
+                    
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ 系统时间同步成功${NC}"
+                        echo -e "${CYAN}新的系统时间: $(date)${NC}"
+                    else
+                        echo -e "${RED}✗ 系统时间同步失败${NC}"
+                    fi
+                    ;;
+                3)
+                    time_sync
+                    return
+                    ;;
+                *)
+                    echo -e "${RED}无效的选择${NC}"
+                    ;;
+            esac
+            
+            read -p "按回车键继续..."
+            time_sync
+            ;;
+        6)
+            # 返回主菜单
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            time_sync
+            ;;
+    esac
+}
+
 # DNS污染检测功能（解析域名对应的10个IP，选择最快的，更新hosts配置）
 dns_pollution_detection() {
     clear
@@ -3619,12 +5349,35 @@ dns_pollution_detection() {
     echo -e "6. 更新hosts配置，只修改该域名相关条目"
     echo ""
     
-    read -p "请输入要检测的域名（如：github.com）: " domain
-    if [ -z "$domain" ]; then
-        echo -e "${RED}域名不能为空${NC}"
-        read -p "按回车键返回主菜单..."
-        return
-    fi
+    echo -e "${CYAN}选择要优化的GitHub域名:${NC}"
+    echo -e "  ${GREEN}1.${NC} github.com"
+    echo -e "  ${GREEN}2.${NC} raw.githubusercontent.com"
+    echo -e "  ${GREEN}3.${NC} api.github.com"
+    echo -e "  ${GREEN}4.${NC} github.github.io"
+    echo ""
+    read -p "请选择 (1-4, 默认1): " domain_choice
+    domain_choice=${domain_choice:-1}
+
+    local domain=""
+    case $domain_choice in
+        1)
+            domain="github.com"
+            ;;
+        2)
+            domain="raw.githubusercontent.com"
+            ;;
+        3)
+            domain="api.github.com"
+            ;;
+        4)
+            domain="github.github.io"
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            read -p "按回车键返回主菜单..."
+            return
+            ;;
+    esac
     
     echo ""
     echo -e "${CYAN}正在检测域名: ${YELLOW}$domain${NC}${CYAN} 的DNS解析...${NC}"
@@ -3939,7 +5692,9 @@ fix_docker_dns_integrated() {
         if [ -n "$ping_result" ]; then
             local avg_time=$(echo "$ping_result" | awk -F '/' '{print $5}')
             echo -e "  ${GREEN}✓ ping延迟: ${avg_time}ms${NC}"
-            ping_score=$((100 - $(echo "$avg_time" | awk '{printf "%d", $1}') / 2))
+            # 将ping延迟转换为整数
+            local avg_time_int=$(echo "$avg_time" | awk '{printf "%d", $1}')
+            ping_score=$((100 - avg_time_int / 2))
             
             if [ $ping_score -lt 0 ]; then
                 ping_score=0
@@ -4563,6 +6318,459 @@ configure_push_notification() {
 
 # 由于时间关系，我先完成主要功能框架，后续可以继续完善具体实现
 
+# 一级/二级菜单
+panel_install_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          面板安装菜单${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}选择面板:${NC}"
+        echo -e "  ${GREEN}1.${NC} 安装宝塔面板"
+        echo -e "  ${GREEN}2.${NC} 安装哪吒监控面板"
+        echo -e "  ${GREEN}3.${NC} 安装 X-UI 面板"
+        echo -e "  ${GREEN}4.${NC} 返回主菜单"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-4): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                function_with_push "install_baota" "安装宝塔面板"
+                ;;
+            2)
+                function_with_push "install_ne_zha" "安装哪吒监控面板"
+                ;;
+            3)
+                function_with_push "install_xui" "安装 X-UI 面板"
+                ;;
+            4)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择，请重新输入${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+network_dns_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          网络与DNS菜单${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}快捷入口:${NC}"
+        echo -e "  ${GREEN}1.${NC} GitHub DNS污染检测与修复"
+        echo -e "  ${GREEN}2.${NC} Docker镜像源DNS检测与修复"
+        echo ""
+        echo -e "${CYAN}更多功能:${NC}"
+        echo -e "  ${GREEN}3.${NC} 网络测速功能"
+        echo -e "  ${GREEN}4.${NC} 时间校准功能"
+        echo -e "  ${GREEN}5.${NC} DNS污染检测与优化"
+        echo -e "  ${GREEN}6.${NC} 返回主菜单"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-6): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                function_with_push "fix_github_dns" "GitHub DNS污染检测与修复"
+                ;;
+            2)
+                function_with_push "fix_docker_dns" "Docker镜像源DNS检测与修复"
+                ;;
+            3)
+                function_with_push "network_speed_test" "网络测速功能"
+                ;;
+            4)
+                function_with_push "time_sync" "时间校准功能"
+                ;;
+            5)
+                function_with_push "dns_pollution_detection" "DNS污染检测与优化"
+                ;;
+            6)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择，请重新输入${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+backup_task_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          数据与备份菜单${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}快捷入口:${NC}"
+        echo -e "  ${GREEN}1.${NC} 数据库备份功能"
+        echo -e "  ${GREEN}2.${NC} 定时任务中心"
+        echo ""
+        echo -e "${CYAN}其他:${NC}"
+        echo -e "  ${GREEN}3.${NC} Docker镜像源切换"
+        echo -e "  ${GREEN}4.${NC} 返回主菜单"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-4): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                function_with_push "database_backup" "数据库备份功能"
+                ;;
+            2)
+                function_with_push "cron_task_center" "定时任务中心"
+                ;;
+            3)
+                function_with_push "docker_mirror_switch" "Docker镜像源切换"
+                ;;
+            4)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择，请重新输入${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+ops_tools_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          运维与工具菜单${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}快捷入口:${NC}"
+        echo -e "  ${GREEN}1.${NC} 安装 Docker"
+        echo -e "  ${GREEN}2.${NC} 运维功能"
+        echo ""
+        echo -e "${CYAN}更多功能:${NC}"
+        echo -e "  ${GREEN}3.${NC} 系统监控工具"
+        echo -e "  ${GREEN}4.${NC} 安全检查工具"
+        echo -e "  ${GREEN}5.${NC} 软件包助手"
+        echo -e "  ${GREEN}6.${NC} 消息推送配置"
+        echo -e "  ${GREEN}7.${NC} 返回主菜单"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-7): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                function_with_push "install_docker" "安装 Docker"
+                ;;
+            2)
+                function_with_push "operation_maintenance" "运维功能"
+                ;;
+            3)
+                system_monitor_menu
+                ;;
+            4)
+                security_check_menu
+                ;;
+            5)
+                package_helper_menu
+                ;;
+            6)
+                function_with_push "configure_push_notification" "消息推送配置"
+                ;;
+            7)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择，请重新输入${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+install_packages() {
+    local packages=()
+    while [ $# -gt 0 ]; do
+        packages+=("$1")
+        shift
+    done
+
+    case $DISTRO in
+        "centos"|"rhel"|"fedora")
+            yum install -y "${packages[@]}"
+            ;;
+        "ubuntu"|"debian")
+            apt update && apt install -y "${packages[@]}"
+            ;;
+        *)
+            echo -e "${RED}不支持的系统，无法自动安装${NC}"
+            return 1
+            ;;
+    esac
+}
+
+system_monitor_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          系统监控工具${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}快捷入口:${NC}"
+        echo -e "  ${GREEN}1.${NC} 启动 htop"
+        echo -e "  ${GREEN}2.${NC} 启动 iotop"
+        echo -e "  ${GREEN}3.${NC} 启动 top"
+        echo ""
+        echo -e "${CYAN}更多功能:${NC}"
+        echo -e "  ${GREEN}4.${NC} CPU/内存/磁盘快览"
+        echo -e "  ${GREEN}5.${NC} 返回上一级"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-5): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                if ! command_exists htop; then
+                    echo -e "${YELLOW}未安装 htop，正在安装...${NC}"
+                    install_packages htop
+                fi
+                htop
+                ;;
+            2)
+                if ! command_exists iotop; then
+                    echo -e "${YELLOW}未安装 iotop，正在安装...${NC}"
+                    install_packages iotop
+                fi
+                iotop
+                ;;
+            3)
+                top
+                ;;
+            4)
+                echo -e "${CYAN}CPU/内存/磁盘快览${NC}"
+                echo ""
+                echo -e "${GREEN}CPU负载:${NC} $(uptime | awk -F'load average:' '{print $2}')"
+                echo -e "${GREEN}内存:${NC}"
+                free -h
+                echo ""
+                echo -e "${GREEN}磁盘:${NC}"
+                df -h | grep -E '^/dev/|^Filesystem'
+                echo ""
+                pause
+                ;;
+            5)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+security_check_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          安全检查工具${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}快捷入口:${NC}"
+        echo -e "  ${GREEN}1.${NC} 查看监听端口"
+        echo -e "  ${GREEN}2.${NC} SSH配置巡检"
+        echo ""
+        echo -e "${CYAN}更多功能:${NC}"
+        echo -e "  ${GREEN}3.${NC} 本机端口检测(常见端口)"
+        echo -e "  ${GREEN}4.${NC} 本机端口检测(自定义)"
+        echo -e "  ${GREEN}5.${NC} 返回上一级"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-5): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                echo -e "${CYAN}监听端口:${NC}"
+                if command_exists ss; then
+                    ss -lntup
+                elif command_exists netstat; then
+                    netstat -lntup
+                else
+                    echo -e "${YELLOW}缺少 ss/netstat，正在安装...${NC}"
+                    install_packages iproute net-tools
+                    ss -lntup 2>/dev/null || netstat -lntup
+                fi
+                pause
+                ;;
+            2)
+                echo -e "${CYAN}SSH配置巡检:${NC}"
+                local sshd_conf="/etc/ssh/sshd_config"
+                if [ -f "$sshd_conf" ]; then
+                    echo -e "${GREEN}PermitRootLogin:${NC} $(grep -E '^\s*PermitRootLogin' "$sshd_conf" | tail -1 | awk '{print $2}')"
+                    echo -e "${GREEN}PasswordAuthentication:${NC} $(grep -E '^\s*PasswordAuthentication' "$sshd_conf" | tail -1 | awk '{print $2}')"
+                    echo -e "${GREEN}Port:${NC} $(grep -E '^\s*Port' "$sshd_conf" | tail -1 | awk '{print $2}')"
+                else
+                    echo -e "${YELLOW}未找到 $sshd_conf${NC}"
+                fi
+                pause
+                ;;
+            3)
+                echo -e "${CYAN}本机端口检测(常见端口):${NC}"
+                local ports=(22 80 443 3306 5432 6379 27017 8080 8443)
+                for p in "${ports[@]}"; do
+                    if (echo >/dev/tcp/127.0.0.1/$p) >/dev/null 2>&1; then
+                        echo -e "  ${GREEN}开放:${NC} $p"
+                    else
+                        echo -e "  ${YELLOW}关闭:${NC} $p"
+                    fi
+                done
+                pause
+                ;;
+            4)
+                read -p "请输入端口列表(用空格分隔，例如: 22 80 443): " custom_ports
+                if [ -z "$custom_ports" ]; then
+                    echo -e "${YELLOW}未输入端口，已取消${NC}"
+                    pause
+                    continue
+                fi
+                echo -e "${CYAN}本机端口检测(自定义):${NC}"
+                for p in $custom_ports; do
+                    if (echo >/dev/tcp/127.0.0.1/$p) >/dev/null 2>&1; then
+                        echo -e "  ${GREEN}开放:${NC} $p"
+                    else
+                        echo -e "  ${YELLOW}关闭:${NC} $p"
+                    fi
+                done
+                pause
+                ;;
+            5)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+package_helper_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          软件包助手${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}快捷入口:${NC}"
+        echo -e "  ${GREEN}1.${NC} 安装常用工具集"
+        echo -e "  ${GREEN}2.${NC} 卸载常用工具集"
+        echo ""
+        echo -e "${CYAN}更多功能:${NC}"
+        echo -e "  ${GREEN}3.${NC} 安装安全工具集"
+        echo -e "  ${GREEN}4.${NC} 卸载安全工具集"
+        echo -e "  ${GREEN}5.${NC} 查看工具安装状态"
+        echo -e "  ${GREEN}6.${NC} 返回上一级"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-6): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                echo -e "${CYAN}正在安装常用工具集...${NC}"
+                install_packages htop iotop net-tools lsof curl wget nc telnet tcpdump mtr iftop
+                echo -e "${GREEN}✓ 安装完成${NC}"
+                pause
+                ;;
+            2)
+                echo -e "${CYAN}正在卸载常用工具集...${NC}"
+                case $DISTRO in
+                    "centos"|"rhel"|"fedora")
+                        yum remove -y htop iotop net-tools lsof curl wget nc telnet tcpdump mtr iftop
+                        ;;
+                    "ubuntu"|"debian")
+                        apt remove -y htop iotop net-tools lsof curl wget netcat telnet tcpdump mtr iftop
+                        ;;
+                    *)
+                        echo -e "${RED}不支持的系统，无法自动卸载${NC}"
+                        ;;
+                esac
+                echo -e "${GREEN}✓ 卸载完成${NC}"
+                pause
+                ;;
+            3)
+                echo -e "${CYAN}正在安装安全工具集...${NC}"
+                case $DISTRO in
+                    "centos"|"rhel"|"fedora")
+                        yum install -y fail2ban firewalld
+                        ;;
+                    "ubuntu"|"debian")
+                        apt update && apt install -y fail2ban ufw
+                        ;;
+                    *)
+                        echo -e "${RED}不支持的系统，无法自动安装${NC}"
+                        ;;
+                esac
+                echo -e "${GREEN}✓ 安装完成${NC}"
+                pause
+                ;;
+            4)
+                echo -e "${CYAN}正在卸载安全工具集...${NC}"
+                case $DISTRO in
+                    "centos"|"rhel"|"fedora")
+                        yum remove -y fail2ban firewalld
+                        ;;
+                    "ubuntu"|"debian")
+                        apt remove -y fail2ban ufw
+                        ;;
+                    *)
+                        echo -e "${RED}不支持的系统，无法自动卸载${NC}"
+                        ;;
+                esac
+                echo -e "${GREEN}✓ 卸载完成${NC}"
+                pause
+                ;;
+            5)
+                echo -e "${CYAN}工具安装状态:${NC}"
+                local tools=(htop iotop netstat ss lsof curl wget nc telnet tcpdump mtr iftop fail2ban ufw firewalld)
+                for t in "${tools[@]}"; do
+                    if command_exists "$t"; then
+                        echo -e "  ${GREEN}已安装:${NC} $t"
+                    else
+                        echo -e "  ${YELLOW}未安装:${NC} $t"
+                    fi
+                done
+                pause
+                ;;
+            6)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
 # 主菜单
 main_menu() {
     while true; do
@@ -4575,78 +6783,44 @@ main_menu() {
         echo -e "${CYAN}系统架构:${NC} $ARCH"
         echo -e "${CYAN}当前时间:${NC} $(date)"
         echo ""
-        echo -e "${GREEN}1.${NC} 安装宝塔面板"
-        echo -e "${GREEN}2.${NC} 安装哪吒监控面板"
-        echo -e "${GREEN}3.${NC} 安装 X-UI 面板"
-        echo -e "${GREEN}4.${NC} GitHub DNS污染检测与修复"
-        echo -e "${GREEN}5.${NC} Docker镜像源DNS检测与修复"
-        echo -e "${GREEN}6.${NC} 安装 Docker"
-        echo -e "${GREEN}7.${NC} 服务器信息"
-        echo -e "${GREEN}8.${NC} 网络测速功能"
-        echo -e "${GREEN}9.${NC} 时间校准功能"
-        echo -e "${GREEN}10.${NC} NAS配置功能"
-        echo -e "${GREEN}11.${NC} 数据库备份功能"
-        echo -e "${GREEN}12.${NC} Docker镜像源切换"
-        echo -e "${GREEN}13.${NC} 防火墙端口管理"
-        echo -e "${GREEN}14.${NC} DNS污染检测与优化"
-        echo -e "${GREEN}15.${NC} 消息推送配置"
-        echo -e "${GREEN}16.${NC} 退出脚本"
+        echo -e "${GREEN}1.${NC} 面板安装"
+        echo -e "${GREEN}2.${NC} 网络与DNS"
+        echo -e "${GREEN}3.${NC} 数据与备份"
+        echo -e "${GREEN}4.${NC} 服务器管理"
+        echo -e "${GREEN}5.${NC} 运维工具"
+        echo -e "${GREEN}6.${NC} Docker功能"
+        echo -e "${GREEN}0.${NC} 退出脚本"
         echo ""
         echo -e "${YELLOW}========================================${NC}"
         echo -e "${YELLOW}提示: 请确保系统有足够的磁盘空间和内存${NC}"
         echo ""
         
-        read -p "请选择功能 (1-16): " choice
+        if ! read_menu_choice "请选择功能 (0-6): " choice; then
+            continue
+        fi
         
         case $choice in
-            1)
-                function_with_push "install_baota" "安装宝塔面板"
-                ;;
-            2)
-                function_with_push "install_ne_zha" "安装哪吒监控面板"
-                ;;
-            3)
-                function_with_push "install_xui" "安装 X-UI 面板"
-                ;;
-            4)
-                function_with_push "fix_github_dns" "GitHub DNS污染检测与修复"
-                ;;
-            5)
-                function_with_push "fix_docker_dns" "Docker镜像源DNS检测与修复"
-                ;;
-            6)
-                function_with_push "install_docker" "安装 Docker"
-                ;;
-            7)
-                function_with_push "show_system_info" "查看服务器信息"
-                ;;
-            8)
-                function_with_push "network_speed_test" "网络测速功能"
-                ;;
-            9)
-                function_with_push "time_sync" "时间校准功能"
-                ;;
-            10)
-                function_with_push "nas_mount_config" "NAS配置功能"
-                ;;
-            11)
-                function_with_push "database_backup" "数据库备份功能"
-                ;;
-            12)
-                function_with_push "docker_mirror_switch" "Docker镜像源切换"
-                ;;
-            13)
-                function_with_push "firewall_management" "防火墙端口管理"
-                ;;
-            14)
-                function_with_push "dns_pollution_detection" "DNS污染检测与优化"
-                ;;
-            15)
-                function_with_push "configure_push_notification" "消息推送配置"
-                ;;
-            16)
+            0)
                 echo -e "${GREEN}感谢使用，再见！${NC}"
                 exit 0
+                ;;
+            1)
+                panel_install_menu
+                ;;
+            2)
+                network_dns_menu
+                ;;
+            3)
+                backup_task_menu
+                ;;
+            4)
+                server_management_menu
+                ;;
+            5)
+                ops_tools_menu
+                ;;
+            6)
+                docker_menu
                 ;;
             *)
                 echo -e "${RED}无效的选择，请重新输入${NC}"
@@ -4654,6 +6828,1220 @@ main_menu() {
                 ;;
         esac
     done
+}
+
+# 服务器管理菜单
+server_management_menu() {
+    while true; do
+        clear
+        echo -e "${PURPLE}========================================${NC}"
+        echo -e "${PURPLE}          服务器管理菜单${NC}"
+        echo -e "${PURPLE}========================================${NC}"
+        echo ""
+        echo -e "${CYAN}服务器管理功能:${NC}"
+        echo -e "  ${GREEN}1.${NC} 查看服务器信息"
+        echo -e "  ${GREEN}2.${NC} 网络测速功能"
+        echo -e "  ${GREEN}3.${NC} 时间校准功能"
+        echo -e "  ${GREEN}4.${NC} 防火墙端口管理"
+        echo -e "  ${GREEN}5.${NC} NAS配置功能"
+        echo -e "  ${GREEN}6.${NC} 返回主菜单"
+        echo ""
+
+        if ! read_menu_choice "请选择功能 (1-6): " choice; then
+            return
+        fi
+
+        case $choice in
+            1)
+                function_with_push "show_system_info" "查看服务器信息"
+                ;;
+            2)
+                function_with_push "network_speed_test" "网络测速功能"
+                ;;
+            3)
+                function_with_push "time_sync" "时间校准功能"
+                ;;
+            4)
+                function_with_push "firewall_management" "防火墙端口管理"
+                ;;
+            5)
+                function_with_push "nas_mount_config" "NAS配置功能"
+                ;;
+            6)
+                return
+                ;;
+            *)
+                echo -e "${RED}无效的选择，请重新输入${NC}"
+                sleep 2
+                ;;
+        esac
+    done
+}
+
+# 运维功能
+operation_maintenance() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          运维功能${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}选择运维类型:${NC}"
+    echo -e "  ${GREEN}1.${NC} Docker服务运维"
+    echo -e "  ${GREEN}2.${NC} MySQL服务运维"
+    echo -e "  ${GREEN}3.${NC} Oracle服务运维"
+    echo -e "  ${GREEN}4.${NC} SQL Server服务运维"
+    echo -e "  ${GREEN}5.${NC} 返回主菜单"
+    echo ""
+    
+    read -p "请选择运维类型 (1-5): " op_choice
+    
+    case $op_choice in
+        1)
+            docker_service_ops
+            ;;
+        2)
+            mysql_service_ops
+            ;;
+        3)
+            oracle_service_ops
+            ;;
+        4)
+            sqlserver_service_ops
+            ;;
+        5)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            operation_maintenance
+            ;;
+    esac
+}
+
+# Docker服务运维
+docker_service_ops() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          Docker服务运维${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    # 检查Docker是否安装
+    if ! command -v docker &> /dev/null; then
+        echo -e "${RED}Docker未安装，请先安装Docker${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+    
+    echo -e "${CYAN}Docker状态信息:${NC}"
+    echo -e "  Docker版本: ${YELLOW}$(docker --version 2>/dev/null)${NC}"
+    echo -e "  容器运行状态: ${YELLOW}$(systemctl is-active docker 2>/dev/null || echo "未知")${NC}"
+    echo -e "  容器总数: ${YELLOW}$(docker ps -aq | wc -l)${NC}"
+    echo -e "  运行中容器: ${YELLOW}$(docker ps -q | wc -l)${NC}"
+    echo -e "  镜像总数: ${YELLOW}$(docker images -q | wc -l)${NC}"
+    echo ""
+    
+    echo -e "${CYAN}Docker服务运维选项:${NC}"
+    echo -e "  ${GREEN}1.${NC} 重启Docker服务"
+    echo -e "  ${GREEN}2.${NC} 停止Docker服务"
+    echo -e "  ${GREEN}3.${NC} 启动Docker服务"
+    echo -e "  ${GREEN}4.${NC} 查看所有镜像"
+    echo -e "  ${GREEN}5.${NC} 查看所有容器"
+    echo -e "  ${GREEN}6.${NC} 查看运行中容器"
+    echo -e "  ${GREEN}7.${NC} 清理无用镜像和容器"
+    echo -e "  ${GREEN}8.${NC} 刷新Docker网络"
+    echo -e "  ${GREEN}9.${NC} 重启Docker守护进程"
+    echo -e "  ${GREEN}10.${NC} 返回上一级"
+    echo ""
+    
+    read -p "请选择操作 (1-10): " docker_choice
+    
+    case $docker_choice in
+        1)
+            echo -e "${CYAN}正在重启Docker服务...${NC}"
+            systemctl restart docker
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ Docker服务重启成功${NC}"
+            else
+                echo -e "${RED}✗ Docker服务重启失败${NC}"
+            fi
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        2)
+            echo -e "${CYAN}正在停止Docker服务...${NC}"
+            systemctl stop docker
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ Docker服务停止成功${NC}"
+            else
+                echo -e "${RED}✗ Docker服务停止失败${NC}"
+            fi
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        3)
+            echo -e "${CYAN}正在启动Docker服务...${NC}"
+            systemctl start docker
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ Docker服务启动成功${NC}"
+            else
+                echo -e "${RED}✗ Docker服务启动失败${NC}"
+            fi
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        4)
+            echo -e "${CYAN}Docker镜像列表:${NC}"
+            echo ""
+            docker images
+            echo ""
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        5)
+            echo -e "${CYAN}Docker容器列表:${NC}"
+            echo ""
+            docker ps -a
+            echo ""
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        6)
+            echo -e "${CYAN}运行中容器列表:${NC}"
+            echo ""
+            docker ps
+            echo ""
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        7)
+            echo -e "${CYAN}正在清理无用Docker资源...${NC}"
+            echo ""
+            
+            echo -e "1. 清理已停止的容器..."
+            docker container prune -f
+            echo ""
+            
+            echo -e "2. 清理无用的镜像..."
+            docker image prune -f
+            echo ""
+            
+            echo -e "3. 清理无用的网络..."
+            docker network prune -f
+            echo ""
+            
+            echo -e "${GREEN}✓ Docker资源清理完成${NC}"
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        8)
+            echo -e "${CYAN}正在刷新Docker网络...${NC}"
+            echo ""
+            
+            # 停止所有容器
+            echo -e "1. 停止所有容器..."
+            docker stop $(docker ps -aq) 2>/dev/null
+            
+            # 重启Docker服务
+            echo -e "2. 重启Docker服务..."
+            systemctl restart docker
+            
+            # 启动容器
+            echo -e "3. 启动容器..."
+            docker start $(docker ps -aq) 2>/dev/null
+            
+            echo ""
+            echo -e "${GREEN}✓ Docker网络刷新完成${NC}"
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        9)
+            echo -e "${CYAN}正在重启Docker守护进程...${NC}"
+            echo ""
+            
+            # 重新加载systemd配置
+            systemctl daemon-reload
+            
+            # 重启Docker服务
+            systemctl restart docker
+            
+            # 检查服务状态
+            if systemctl is-active --quiet docker; then
+                echo -e "${GREEN}✓ Docker守护进程重启成功${NC}"
+                echo -e "  状态: $(systemctl status docker --no-pager --lines=0 | grep Active)"
+            else
+                echo -e "${RED}✗ Docker守护进程重启失败${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            docker_service_ops
+            ;;
+        10)
+            operation_maintenance
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            docker_service_ops
+            ;;
+    esac
+}
+
+# MySQL服务运维
+mysql_service_ops() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          MySQL服务运维${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}MySQL服务运维选项:${NC}"
+    echo -e "  ${GREEN}1.${NC} 启动MySQL服务"
+    echo -e "  ${GREEN}2.${NC} 停止MySQL服务"
+    echo -e "  ${GREEN}3.${NC} 重启MySQL服务"
+    echo -e "  ${GREEN}4.${NC} 修改MySQL root密码"
+    echo -e "  ${GREEN}5.${NC} 查看MySQL用户列表"
+    echo -e "  ${GREEN}6.${NC} 新增MySQL用户"
+    echo -e "  ${GREEN}7.${NC} 管理MySQL用户权限"
+    echo -e "  ${GREEN}8.${NC} 查看MySQL运行状态"
+    echo -e "  ${GREEN}9.${NC} 备份MySQL数据库"
+    echo -e "  ${GREEN}10.${NC} 恢复MySQL数据库"
+    echo -e "  ${GREEN}11.${NC} 返回上一级"
+    echo ""
+    
+    read -p "请选择操作 (1-11): " mysql_choice
+    
+    case $mysql_choice in
+        1)
+            echo -e "${CYAN}正在启动MySQL服务...${NC}"
+            if systemctl start mysql 2>/dev/null || systemctl start mariadb 2>/dev/null || systemctl start mysqld 2>/dev/null; then
+                echo -e "${GREEN}✓ MySQL服务启动成功${NC}"
+            else
+                echo -e "${RED}✗ MySQL服务启动失败，请检查MySQL是否安装${NC}"
+            fi
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        2)
+            echo -e "${CYAN}正在停止MySQL服务...${NC}"
+            if systemctl stop mysql 2>/dev/null || systemctl stop mariadb 2>/dev/null || systemctl stop mysqld 2>/dev/null; then
+                echo -e "${GREEN}✓ MySQL服务停止成功${NC}"
+            else
+                echo -e "${RED}✗ MySQL服务停止失败，请检查MySQL是否安装${NC}"
+            fi
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        3)
+            echo -e "${CYAN}正在重启MySQL服务...${NC}"
+            if systemctl restart mysql 2>/dev/null || systemctl restart mariadb 2>/dev/null || systemctl restart mysqld 2>/dev/null; then
+                echo -e "${GREEN}✓ MySQL服务重启成功${NC}"
+            else
+                echo -e "${RED}✗ MySQL服务重启失败，请检查MySQL是否安装${NC}"
+            fi
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        4)
+            echo -e "${CYAN}修改MySQL root密码${NC}"
+            echo ""
+            
+            # 检查MySQL是否运行
+            if ! systemctl is-active --quiet mysql 2>/dev/null && ! systemctl is-active --quiet mariadb 2>/dev/null && ! systemctl is-active --quiet mysqld 2>/dev/null; then
+                echo -e "${YELLOW}MySQL服务未运行，请先启动MySQL服务${NC}"
+                read -p "按回车键继续..."
+                mysql_service_ops
+                return
+            fi
+            
+            read -p "请输入旧密码 (如果忘记请按回车跳过): " old_pass
+            read -p "请输入新密码: " new_pass
+            
+            if [ -n "$old_pass" ]; then
+                # 使用旧密码修改
+                mysqladmin -u root -p"$old_pass" password "$new_pass" 2>/dev/null
+            else
+                # 尝试无密码修改
+                mysqladmin -u root password "$new_pass" 2>/dev/null
+            fi
+            
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ MySQL root密码修改成功${NC}"
+                echo -e "${YELLOW}请务必记好新密码: $new_pass${NC}"
+            else
+                echo -e "${RED}✗ MySQL root密码修改失败${NC}"
+                echo -e "${YELLOW}可能原因:${NC}"
+                echo -e "1. 旧密码错误"
+                echo -e "2. MySQL服务异常"
+                echo -e "3. 权限不足"
+            fi
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        5)
+            echo -e "${CYAN}MySQL用户列表:${NC}"
+            echo ""
+            
+            # 尝试连接MySQL并查询用户
+            mysql -e "SELECT User, Host, authentication_string FROM mysql.user;" 2>/dev/null
+            
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}无法连接MySQL数据库${NC}"
+                echo -e "${YELLOW}可能原因:${NC}"
+                echo -e "1. MySQL服务未运行"
+                echo -e "2. 密码错误或未设置"
+                echo -e "3. 权限不足"
+            fi
+            
+            echo ""
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        6)
+            echo -e "${CYAN}新增MySQL用户${NC}"
+            echo ""
+            
+            read -p "请输入新用户名: " new_user
+            read -p "请输入新用户密码: " new_user_pass
+            read -p "请输入允许访问的主机 (默认: %, 表示所有主机): " user_host
+            user_host=${user_host:-%}
+            
+            if [ -n "$new_user" ] && [ -n "$new_user_pass" ]; then
+                echo -e "${CYAN}正在创建用户 $new_user@$user_host ...${NC}"
+                
+                # 创建用户
+                mysql -e "CREATE USER '$new_user'@'$user_host' IDENTIFIED BY '$new_user_pass';" 2>/dev/null
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ MySQL用户创建成功${NC}"
+                    echo -e "  用户名: $new_user"
+                    echo -e "  主机: $user_host"
+                    echo -e "  密码: $new_user_pass"
+                else
+                    echo -e "${RED}✗ MySQL用户创建失败${NC}"
+                fi
+            else
+                echo -e "${RED}用户名和密码不能为空${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        7)
+            echo -e "${CYAN}MySQL用户权限管理${NC}"
+            echo ""
+            
+            echo -e "${CYAN}权限管理选项:${NC}"
+            echo -e "  ${GREEN}1.${NC} 授予用户数据库权限"
+            echo -e "  ${GREEN}2.${NC} 撤销用户数据库权限"
+            echo -e "  ${GREEN}3.${NC} 查看用户权限"
+            echo -e "  ${GREEN}4.${NC} 删除用户"
+            echo -e "  ${GREEN}5.${NC} 返回上一级"
+            echo ""
+            
+            read -p "请选择操作 (1-5): " perm_choice
+            
+            case $perm_choice in
+                1)
+                    echo -e "${CYAN}授予用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " grant_user
+                    read -p "请输入主机 (默认: %): " grant_host
+                    grant_host=${grant_host:-%}
+                    read -p "请输入数据库名 (默认: *, 表示所有数据库): " grant_db
+                    grant_db=${grant_db:-*}
+                    read -p "请输入权限列表 (如: SELECT,INSERT,UPDATE,DELETE 或 ALL PRIVILEGES): " grant_privs
+                    
+                    if [ "$grant_db" = "*" ]; then
+                        mysql -e "GRANT $grant_privs ON *.* TO '$grant_user'@'$grant_host';" 2>/dev/null
+                    else
+                        mysql -e "GRANT $grant_privs ON $grant_db.* TO '$grant_user'@'$grant_host';" 2>/dev/null
+                    fi
+                    
+                    if [ $? -eq 0 ]; then
+                        mysql -e "FLUSH PRIVILEGES;"
+                        echo -e "${GREEN}✓ 权限授予成功${NC}"
+                    else
+                        echo -e "${RED}✗ 权限授予失败${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    mysql_service_ops
+                    ;;
+                2)
+                    echo -e "${CYAN}撤销用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " revoke_user
+                    read -p "请输入主机 (默认: %): " revoke_host
+                    revoke_host=${revoke_host:-%}
+                    read -p "请输入数据库名 (默认: *, 表示所有数据库): " revoke_db
+                    revoke_db=${revoke_db:-*}
+                    read -p "请输入要撤销的权限列表: " revoke_privs
+                    
+                    if [ "$revoke_db" = "*" ]; then
+                        mysql -e "REVOKE $revoke_privs ON *.* FROM '$revoke_user'@'$revoke_host';" 2>/dev/null
+                    else
+                        mysql -e "REVOKE $revoke_privs ON $revoke_db.* FROM '$revoke_user'@'$revoke_host';" 2>/dev/null
+                    fi
+                    
+                    if [ $? -eq 0 ]; then
+                        mysql -e "FLUSH PRIVILEGES;"
+                        echo -e "${GREEN}✓ 权限撤销成功${NC}"
+                    else
+                        echo -e "${RED}✗ 权限撤销失败${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    mysql_service_ops
+                    ;;
+                3)
+                    echo -e "${CYAN}查看用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " show_user
+                    read -p "请输入主机 (默认: %): " show_host
+                    show_host=${show_host:-%}
+                    
+                    mysql -e "SHOW GRANTS FOR '$show_user'@'$show_host';" 2>/dev/null
+                    
+                    if [ $? -ne 0 ]; then
+                        echo -e "${RED}无法查看用户权限${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    mysql_service_ops
+                    ;;
+                4)
+                    echo -e "${CYAN}删除用户${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " delete_user
+                    read -p "请输入主机 (默认: %): " delete_host
+                    delete_host=${delete_host:-%}
+                    
+                    echo -e "${YELLOW}警告: 即将删除用户 $delete_user@$delete_host，此操作不可逆！${NC}"
+                    read -p "确认删除？(y/n): " confirm_delete
+                    
+                    if [[ $confirm_delete == "y" || $confirm_delete == "Y" ]]; then
+                        mysql -e "DROP USER '$delete_user'@'$delete_host';" 2>/dev/null
+                        
+                        if [ $? -eq 0 ]; then
+                            echo -e "${GREEN}✓ 用户删除成功${NC}"
+                        else
+                            echo -e "${RED}✗ 用户删除失败${NC}"
+                        fi
+                    else
+                        echo -e "${YELLOW}已取消删除操作${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    mysql_service_ops
+                    ;;
+                5)
+                    mysql_service_ops
+                    return
+                    ;;
+                *)
+                    echo -e "${RED}无效的选择${NC}"
+                    sleep 2
+                    ;;
+            esac
+            
+            mysql_service_ops
+            ;;
+        8)
+            echo -e "${CYAN}MySQL运行状态:${NC}"
+            echo ""
+            
+            # 检查MySQL服务状态
+            if systemctl is-active --quiet mysql 2>/dev/null || systemctl is-active --quiet mariadb 2>/dev/null || systemctl is-active --quiet mysqld 2>/dev/null; then
+                echo -e "${GREEN}✓ MySQL服务正在运行${NC}"
+                echo ""
+                
+                # 尝试获取MySQL状态
+                mysql -e "STATUS;" 2>/dev/null || mysql -e "SHOW GLOBAL STATUS LIKE 'Uptime';" 2>/dev/null
+                
+                if [ $? -ne 0 ]; then
+                    echo -e "${YELLOW}无法获取详细状态信息${NC}"
+                fi
+            else
+                echo -e "${RED}✗ MySQL服务未运行${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        9)
+            echo -e "${CYAN}备份MySQL数据库${NC}"
+            echo ""
+            
+            read -p "请输入数据库名: " backup_db_name
+            read -p "请输入备份文件路径 (默认: /opt/backup/mysql): " backup_path
+            backup_path=${backup_path:-/opt/backup/mysql}
+            
+            mkdir -p "$backup_path"
+            
+            local timestamp=$(date +%Y%m%d_%H%M%S)
+            local backup_file="${backup_path}/${backup_db_name}_${timestamp}.sql"
+            local backup_file_gz="${backup_file}.gz"
+            
+            echo -e "${CYAN}正在备份数据库: $backup_db_name${NC}"
+            
+            # 设置MySQL密码环境变量
+            if [ -n "$MYSQL_PASSWORD" ]; then
+                export MYSQL_PWD="$MYSQL_PASSWORD"
+            fi
+            
+            mysqldump --single-transaction "$backup_db_name" > "$backup_file"
+            
+            if [ $? -eq 0 ]; then
+                echo -e "${GREEN}✓ 数据库备份成功${NC}"
+                
+                # 压缩备份文件
+                gzip "$backup_file"
+                local file_size=$(du -h "$backup_file_gz" | awk '{print $1}')
+                
+                echo -e "${CYAN}备份信息:${NC}"
+                echo -e "  数据库: $backup_db_name"
+                echo -e "  备份文件: $backup_file_gz"
+                echo -e "  文件大小: $file_size"
+                echo -e "  备份时间: $(date)"
+            else
+                echo -e "${RED}✗ 数据库备份失败${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        10)
+            echo -e "${CYAN}恢复MySQL数据库${NC}"
+            echo ""
+            
+            read -p "请输入备份文件路径: " restore_file
+            read -p "请输入要恢复的数据库名: " restore_db_name
+            
+            if [ -f "$restore_file" ]; then
+                echo -e "${CYAN}正在恢复数据库: $restore_db_name${NC}"
+                
+                # 如果文件是.gz格式，先解压
+                if [[ "$restore_file" == *.gz ]]; then
+                    gunzip -c "$restore_file" | mysql "$restore_db_name" 2>/dev/null
+                else
+                    mysql "$restore_db_name" < "$restore_file" 2>/dev/null
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ 数据库恢复成功${NC}"
+                else
+                    echo -e "${RED}✗ 数据库恢复失败${NC}"
+                fi
+            else
+                echo -e "${RED}备份文件不存在: $restore_file${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            mysql_service_ops
+            ;;
+        11)
+            operation_maintenance
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            mysql_service_ops
+            ;;
+    esac
+}
+
+# Oracle服务运维
+oracle_service_ops() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          Oracle服务运维${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}Oracle服务运维选项:${NC}"
+    echo -e "  ${GREEN}1.${NC} 启动Oracle数据库服务"
+    echo -e "  ${GREEN}2.${NC} 停止Oracle数据库服务"
+    echo -e "  ${GREEN}3.${NC} 重启Oracle数据库服务"
+    echo -e "  ${GREEN}4.${NC} 查看Oracle运行状态"
+    echo -e "  ${GREEN}5.${NC} 修改Oracle用户密码"
+    echo -e "  ${GREEN}6.${NC} 查看Oracle用户列表"
+    echo -e "  ${GREEN}7.${NC} 管理Oracle用户权限"
+    echo -e "  ${GREEN}8.${NC} 备份Oracle数据库"
+    echo -e "  ${GREEN}9.${NC} 恢复Oracle数据库"
+    echo -e "  ${GREEN}10.${NC} 返回上一级"
+    echo ""
+    
+    read -p "请选择操作 (1-10): " oracle_choice
+    
+    case $oracle_choice in
+        1)
+            echo -e "${CYAN}正在启动Oracle数据库服务...${NC}"
+            
+            # 尝试多种启动方式
+            if command -v sqlplus &> /dev/null; then
+                echo -e "${YELLOW}需要以oracle用户身份启动，请手动执行:${NC}"
+                echo -e "  ${CYAN}su - oracle${NC}"
+                echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                echo -e "  ${CYAN}STARTUP${NC}"
+            else
+                echo -e "${RED}未找到Oracle客户端工具${NC}"
+            fi
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        2)
+            echo -e "${CYAN}正在停止Oracle数据库服务...${NC}"
+            
+            # 尝试多种停止方式
+            if command -v sqlplus &> /dev/null; then
+                echo -e "${YELLOW}需要以oracle用户身份停止，请手动执行:${NC}"
+                echo -e "  ${CYAN}su - oracle${NC}"
+                echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                echo -e "  ${CYAN}SHUTDOWN IMMEDIATE${NC}"
+            else
+                echo -e "${RED}未找到Oracle客户端工具${NC}"
+            fi
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        3)
+            echo -e "${CYAN}正在重启Oracle数据库服务...${NC}"
+            
+            echo -e "${YELLOW}需要以oracle用户身份重启，请手动执行:${NC}"
+            echo -e "  ${CYAN}su - oracle${NC}"
+            echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+            echo -e "  ${CYAN}SHUTDOWN IMMEDIATE${NC}"
+            echo -e "  ${CYAN}STARTUP${NC}"
+            
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        4)
+            echo -e "${CYAN}Oracle数据库运行状态:${NC}"
+            echo ""
+            
+            # 检查Oracle相关服务
+            if systemctl is-active --quiet oracle-xe 2>/dev/null || systemctl is-active --quiet oracle-db 2>/dev/null; then
+                echo -e "${GREEN}✓ Oracle数据库服务正在运行${NC}"
+                echo ""
+                
+                # 尝试获取Oracle状态
+                if command -v sqlplus &> /dev/null; then
+                    echo -e "${CYAN}使用sqlplus查询数据库状态:${NC}"
+                    echo ""
+                    echo -e "${YELLOW}需要提供Oracle连接信息才能查询详细状态${NC}"
+                else
+                    echo -e "${YELLOW}未安装Oracle客户端工具${NC}"
+                fi
+            else
+                echo -e "${RED}✗ Oracle数据库服务未运行${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        5)
+            echo -e "${CYAN}修改Oracle用户密码${NC}"
+            echo ""
+            
+            read -p "请输入Oracle用户名: " oracle_user
+            read -p "请输入新密码: " oracle_new_pass
+            
+            if [ -n "$oracle_user" ] && [ -n "$oracle_new_pass" ]; then
+                echo -e "${CYAN}正在修改用户 $oracle_user 的密码...${NC}"
+                echo -e "${YELLOW}需要使用sqlplus连接Oracle数据库执行:${NC}"
+                echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                echo -e "  ${CYAN}ALTER USER $oracle_user IDENTIFIED BY \"$oracle_new_pass\";${NC}"
+            else
+                echo -e "${RED}用户名和新密码不能为空${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        6)
+            echo -e "${CYAN}Oracle用户列表:${NC}"
+            echo ""
+            
+            if command -v sqlplus &> /dev/null; then
+                echo -e "${CYAN}使用sqlplus查询用户列表:${NC}"
+                echo ""
+                echo -e "${YELLOW}需要提供Oracle连接信息才能查询用户列表${NC}"
+                echo ""
+                echo -e "示例命令:"
+                echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                echo -e "  ${CYAN}SELECT username, account_status, created FROM dba_users ORDER BY username;${NC}"
+            else
+                echo -e "${RED}未安装Oracle客户端工具${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        7)
+            echo -e "${CYAN}Oracle用户权限管理${NC}"
+            echo ""
+            
+            echo -e "${CYAN}权限管理选项:${NC}"
+            echo -e "  ${GREEN}1.${NC} 授予用户权限"
+            echo -e "  ${GREEN}2.${NC} 撤销用户权限"
+            echo -e "  ${GREEN}3.${NC} 查看用户权限"
+            echo -e "  ${GREEN}4.${NC} 返回上一级"
+            echo ""
+            
+            read -p "请选择操作 (1-4): " oracle_perm_choice
+            
+            case $oracle_perm_choice in
+                1)
+                    echo -e "${CYAN}授予Oracle用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " grant_oracle_user
+                    read -p "请输入权限 (如: CREATE SESSION, CREATE TABLE, DBA): " grant_oracle_priv
+                    
+                    if [ -n "$grant_oracle_user" ] && [ -n "$grant_oracle_priv" ]; then
+                        echo -e "${YELLOW}需要使用sqlplus连接Oracle数据库执行:${NC}"
+                        echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                        echo -e "  ${CYAN}GRANT $grant_oracle_priv TO $grant_oracle_user;${NC}"
+                    else
+                        echo -e "${RED}用户名和权限不能为空${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    oracle_service_ops
+                    ;;
+                2)
+                    echo -e "${CYAN}撤销Oracle用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " revoke_oracle_user
+                    read -p "请输入要撤销的权限: " revoke_oracle_priv
+                    
+                    if [ -n "$revoke_oracle_user" ] && [ -n "$revoke_oracle_priv" ]; then
+                        echo -e "${YELLOW}需要使用sqlplus连接Oracle数据库执行:${NC}"
+                        echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                        echo -e "  ${CYAN}REVOKE $revoke_oracle_priv FROM $revoke_oracle_user;${NC}"
+                    else
+                        echo -e "${RED}用户名和权限不能为空${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    oracle_service_ops
+                    ;;
+                3)
+                    echo -e "${CYAN}查看Oracle用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " show_oracle_user
+                    
+                    if [ -n "$show_oracle_user" ]; then
+                        echo -e "${YELLOW}需要使用sqlplus连接Oracle数据库执行:${NC}"
+                        echo -e "  ${CYAN}sqlplus / as sysdba${NC}"
+                        echo -e "  ${CYAN}SELECT * FROM dba_role_privs WHERE grantee='$show_oracle_user';${NC}"
+                        echo -e "  ${CYAN}SELECT * FROM dba_sys_privs WHERE grantee='$show_oracle_user';${NC}"
+                    else
+                        echo -e "${RED}用户名不能为空${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    oracle_service_ops
+                    ;;
+                4)
+                    oracle_service_ops
+                    return
+                    ;;
+                *)
+                    echo -e "${RED}无效的选择${NC}"
+                    sleep 2
+                    ;;
+            esac
+            
+            ;;
+        8)
+            echo -e "${CYAN}备份Oracle数据库${NC}"
+            echo ""
+            
+            echo -e "${YELLOW}Oracle数据库备份需要管理员权限，建议使用RMAN工具${NC}"
+            echo ""
+            
+            echo -e "常用备份方法:"
+            echo -e "1. 使用RMAN进行全量备份"
+            echo -e "2. 使用数据泵(expdp)导出数据"
+            echo -e "3. 使用exp导出数据"
+            echo ""
+            
+            echo -e "示例命令:"
+            echo -e "  ${CYAN}# 使用RMAN全量备份${NC}"
+            echo -e "  ${CYAN}rman target /${NC}"
+            echo -e "  ${CYAN}BACKUP DATABASE PLUS ARCHIVELOG;${NC}"
+            echo ""
+            echo -e "  ${CYAN}# 使用expdp导出${NC}"
+            echo -e "  ${CYAN}expdp username/password directory=DATA_PUMP_DIR dumpfile=backup.dmp logfile=backup.log full=y${NC}"
+            
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        9)
+            echo -e "${CYAN}恢复Oracle数据库${NC}"
+            echo ""
+            
+            echo -e "${YELLOW}Oracle数据库恢复需要管理员权限，建议使用RMAN工具${NC}"
+            echo ""
+            
+            echo -e "常用恢复方法:"
+            echo -e "1. 使用RMAN进行恢复"
+            echo -e "2. 使用数据泵(impdp)导入数据"
+            echo -e "3. 使用imp导入数据"
+            echo ""
+            
+            echo -e "示例命令:"
+            echo -e "  ${CYAN}# 使用RMAN恢复${NC}"
+            echo -e "  ${CYAN}rman target /${NC}"
+            echo -e "  ${CYAN}RESTORE DATABASE;${NC}"
+            echo -e "  ${CYAN}RECOVER DATABASE;${NC}"
+            echo ""
+            echo -e "  ${CYAN}# 使用impdp导入${NC}"
+            echo -e "  ${CYAN}impdp username/password directory=DATA_PUMP_DIR dumpfile=backup.dmp logfile=restore.log full=y${NC}"
+            
+            read -p "按回车键继续..."
+            oracle_service_ops
+            ;;
+        10)
+            operation_maintenance
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            oracle_service_ops
+            ;;
+    esac
+}
+
+# SQL Server服务运维
+sqlserver_service_ops() {
+    clear
+    echo -e "${PURPLE}========================================${NC}"
+    echo -e "${PURPLE}          SQL Server服务运维${NC}"
+    echo -e "${PURPLE}========================================${NC}"
+    echo ""
+    
+    echo -e "${CYAN}SQL Server服务运维选项:${NC}"
+    echo -e "  ${GREEN}1.${NC} 启动SQL Server服务"
+    echo -e "  ${GREEN}2.${NC} 停止SQL Server服务"
+    echo -e "  ${GREEN}3.${NC} 重启SQL Server服务"
+    echo -e "  ${GREEN}4.${NC} 查看SQL Server运行状态"
+    echo -e "  ${GREEN}5.${NC} 修改SQL Server用户密码"
+    echo -e "  ${GREEN}6.${NC} 查看SQL Server用户列表"
+    echo -e "  ${GREEN}7.${NC} 管理SQL Server用户权限"
+    echo -e "  ${GREEN}8.${NC} 备份SQL Server数据库"
+    echo -e "  ${GREEN}9.${NC} 恢复SQL Server数据库"
+    echo -e "  ${GREEN}10.${NC} 返回上一级"
+    echo ""
+    
+    read -p "请选择操作 (1-10): " sqlserver_choice
+    
+    case $sqlserver_choice in
+        1)
+            echo -e "${CYAN}正在启动SQL Server服务...${NC}"
+            
+            # 尝试多种启动方式
+            if systemctl start mssql-server 2>/dev/null || service mssql-server start 2>/dev/null; then
+                echo -e "${GREEN}✓ SQL Server服务启动成功${NC}"
+            else
+                echo -e "${RED}✗ SQL Server服务启动失败，请检查SQL Server是否安装${NC}"
+            fi
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        2)
+            echo -e "${CYAN}正在停止SQL Server服务...${NC}"
+            
+            if systemctl stop mssql-server 2>/dev/null || service mssql-server stop 2>/dev/null; then
+                echo -e "${GREEN}✓ SQL Server服务停止成功${NC}"
+            else
+                echo -e "${RED}✗ SQL Server服务停止失败${NC}"
+            fi
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        3)
+            echo -e "${CYAN}正在重启SQL Server服务...${NC}"
+            
+            if systemctl restart mssql-server 2>/dev/null || service mssql-server restart 2>/dev/null; then
+                echo -e "${GREEN}✓ SQL Server服务重启成功${NC}"
+            else
+                echo -e "${RED}✗ SQL Server服务重启失败，请检查SQL Server是否安装${NC}"
+            fi
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        4)
+            echo -e "${CYAN}SQL Server运行状态:${NC}"
+            echo ""
+            
+            # 检查SQL Server服务状态
+            if systemctl is-active --quiet mssql-server 2>/dev/null; then
+                echo -e "${GREEN}✓ SQL Server服务正在运行${NC}"
+                echo ""
+                
+                # 尝试获取SQL Server状态
+                if command -v sqlcmd &> /dev/null; then
+                    echo -e "${CYAN}使用sqlcmd查询数据库状态:${NC}"
+                    echo ""
+                    
+                    # 尝试查询版本信息
+                    sqlcmd -S localhost -U SA -Q "SELECT @@VERSION" 2>/dev/null || \
+                    echo -e "${YELLOW}无法连接SQL Server数据库${NC}"
+                else
+                    echo -e "${YELLOW}未安装SQL Server客户端工具${NC}"
+                fi
+            else
+                echo -e "${RED}✗ SQL Server服务未运行${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        5)
+            echo -e "${CYAN}修改SQL Server用户密码${NC}"
+            echo ""
+            
+            read -p "请输入SQL Server用户名: " sqlserver_user
+            read -p "请输入旧密码: " sqlserver_old_pass
+            read -p "请输入新密码: " sqlserver_new_pass
+            
+            if [ -n "$sqlserver_user" ] && [ -n "$sqlserver_new_pass" ]; then
+                echo -e "${CYAN}正在修改用户 $sqlserver_user 的密码...${NC}"
+                
+                # 使用sqlcmd修改密码
+                if command -v sqlcmd &> /dev/null; then
+                    echo -e "${YELLOW}使用sqlcmd修改密码:${NC}"
+                    echo ""
+                    
+                    # 尝试修改密码
+                    sqlcmd -S localhost -U SA -Q "ALTER LOGIN $sqlserver_user WITH PASSWORD = '$sqlserver_new_pass' OLD_PASSWORD = '$sqlserver_old_pass';" 2>/dev/null
+                    
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ SQL Server用户密码修改成功${NC}"
+                    else
+                        echo -e "${RED}✗ SQL Server用户密码修改失败${NC}"
+                    fi
+                else
+                    echo -e "${RED}未安装SQL Server客户端工具${NC}"
+                fi
+            else
+                echo -e "${RED}用户名和新密码不能为空${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        6)
+            echo -e "${CYAN}SQL Server用户列表:${NC}"
+            echo ""
+            
+            if command -v sqlcmd &> /dev/null; then
+                echo -e "${CYAN}使用sqlcmd查询用户列表:${NC}"
+                echo ""
+                
+                # 尝试查询用户列表
+                sqlcmd -S localhost -U SA -Q "SELECT name, type_desc, create_date FROM sys.server_principals WHERE type IN ('S', 'U', 'G') ORDER BY name;" 2>/dev/null
+                
+                if [ $? -ne 0 ]; then
+                    echo -e "${YELLOW}无法连接SQL Server数据库${NC}"
+                fi
+            else
+                echo -e "${RED}未安装SQL Server客户端工具${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        7)
+            echo -e "${CYAN}SQL Server用户权限管理${NC}"
+            echo ""
+            
+            echo -e "${CYAN}权限管理选项:${NC}"
+            echo -e "  ${GREEN}1.${NC} 授予用户权限"
+            echo -e "  ${GREEN}2.${NC} 撤销用户权限"
+            echo -e "  ${GREEN}3.${NC} 查看用户权限"
+            echo -e "  ${GREEN}4.${NC} 返回上一级"
+            echo ""
+            
+            read -p "请选择操作 (1-4): " sqlserver_perm_choice
+            
+            case $sqlserver_perm_choice in
+                1)
+                    echo -e "${CYAN}授予SQL Server用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " grant_sqlserver_user
+                    read -p "请输入数据库名: " grant_sqlserver_db
+                    read -p "请输入权限 (如: db_datareader, db_datawriter, db_owner): " grant_sqlserver_priv
+                    
+                    if [ -n "$grant_sqlserver_user" ] && [ -n "$grant_sqlserver_db" ] && [ -n "$grant_sqlserver_priv" ]; then
+                        echo -e "${CYAN}正在为用户 $grant_sqlserver_user 授予 $grant_sqlserver_priv 权限...${NC}"
+                        echo -e "${YELLOW}使用sqlcmd执行:${NC}"
+                        echo -e "  ${CYAN}sqlcmd -S localhost -U SA -Q \"USE [$grant_sqlserver_db]; ALTER ROLE $grant_sqlserver_priv ADD MEMBER $grant_sqlserver_user;\"${NC}"
+                    else
+                        echo -e "${RED}用户名、数据库名和权限不能为空${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    sqlserver_service_ops
+                    ;;
+                2)
+                    echo -e "${CYAN}撤销SQL Server用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " revoke_sqlserver_user
+                    read -p "请输入数据库名: " revoke_sqlserver_db
+                    read -p "请输入要撤销的权限: " revoke_sqlserver_priv
+                    
+                    if [ -n "$revoke_sqlserver_user" ] && [ -n "$revoke_sqlserver_db" ] && [ -n "$revoke_sqlserver_priv" ]; then
+                        echo -e "${CYAN}正在撤销用户 $revoke_sqlserver_user 的 $revoke_sqlserver_priv 权限...${NC}"
+                        echo -e "${YELLOW}使用sqlcmd执行:${NC}"
+                        echo -e "  ${CYAN}sqlcmd -S localhost -U SA -Q \"USE [$revoke_sqlserver_db]; ALTER ROLE $revoke_sqlserver_priv DROP MEMBER $revoke_sqlserver_user;\"${NC}"
+                    else
+                        echo -e "${RED}用户名、数据库名和权限不能为空${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    sqlserver_service_ops
+                    ;;
+                3)
+                    echo -e "${CYAN}查看SQL Server用户权限${NC}"
+                    echo ""
+                    
+                    read -p "请输入用户名: " show_sqlserver_user
+                    read -p "请输入数据库名: " show_sqlserver_db
+                    
+                    if [ -n "$show_sqlserver_user" ] && [ -n "$show_sqlserver_db" ]; then
+                        echo -e "${CYAN}正在查看用户 $show_sqlserver_user 在数据库 $show_sqlserver_db 中的权限...${NC}"
+                        echo -e "${YELLOW}使用sqlcmd执行:${NC}"
+                        echo -e "  ${CYAN}sqlcmd -S localhost -U SA -Q \"USE [$show_sqlserver_db]; EXEC sp_helprotect @username = N'$show_sqlserver_user';\"${NC}"
+                    else
+                        echo -e "${RED}用户名和数据库名不能为空${NC}"
+                    fi
+                    
+                    read -p "按回车键继续..."
+                    sqlserver_service_ops
+                    ;;
+                4)
+                    sqlserver_service_ops
+                    return
+                    ;;
+                *)
+                    echo -e "${RED}无效的选择${NC}"
+                    sleep 2
+                    ;;
+            esac
+            
+            ;;
+        8)
+            echo -e "${CYAN}备份SQL Server数据库${NC}"
+            echo ""
+            
+            read -p "请输入数据库名: " backup_sqlserver_db
+            read -p "请输入备份文件路径 (默认: /opt/backup/sqlserver): " backup_path
+            backup_path=${backup_path:-/opt/backup/sqlserver}
+            
+            mkdir -p "$backup_path"
+            
+            local timestamp=$(date +%Y%m%d_%H%M%S)
+            local backup_file="${backup_path}/${backup_sqlserver_db}_${timestamp}.bak"
+            local backup_file_compressed="${backup_file}.gz"
+            
+            echo -e "${CYAN}正在备份数据库: $backup_sqlserver_db${NC}"
+            
+            # 使用sqlcmd备份数据库
+            if command -v sqlcmd &> /dev/null; then
+                sqlcmd -S localhost -U SA -Q "BACKUP DATABASE [$backup_sqlserver_db] TO DISK = N'$backup_file' WITH INIT, FORMAT, STATS = 10;" 2>/dev/null
+                
+                if [ $? -eq 0 ]; then
+                    echo -e "${GREEN}✓ SQL Server数据库备份成功${NC}"
+                    
+                    # 压缩备份文件
+                    gzip "$backup_file"
+                    local file_size=$(du -h "$backup_file_compressed" | awk '{print $1}')
+                    
+                    echo -e "${CYAN}备份信息:${NC}"
+                    echo -e "  数据库: $backup_sqlserver_db"
+                    echo -e "  备份文件: $backup_file_compressed"
+                    echo -e "  文件大小: $file_size"
+                    echo -e "  备份时间: $(date)"
+                else
+                    echo -e "${RED}✗ SQL Server数据库备份失败${NC}"
+                fi
+            else
+                echo -e "${RED}未安装SQL Server客户端工具${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        9)
+            echo -e "${CYAN}恢复SQL Server数据库${NC}"
+            echo ""
+            
+            read -p "请输入备份文件路径: " restore_file
+            read -p "请输入要恢复的数据库名: " restore_db_name
+            
+            if [ -f "$restore_file" ]; then
+                echo -e "${CYAN}正在恢复数据库: $restore_db_name${NC}"
+                
+                # 如果备份文件是.gz格式，先解压
+                local restore_source="$restore_file"
+                if [[ "$restore_file" == *.gz ]]; then
+                    local temp_file=$(mktemp)
+                    gunzip -c "$restore_file" > "$temp_file"
+                    restore_source="$temp_file"
+                fi
+                
+                # 使用sqlcmd恢复数据库
+                if command -v sqlcmd &> /dev/null; then
+                    echo -e "${YELLOW}注意: 恢复前确保目标数据库没有活动连接${NC}"
+                    
+                    sqlcmd -S localhost -U SA -Q "RESTORE DATABASE [$restore_db_name] FROM DISK = N'$restore_source' WITH REPLACE, STATS = 10;" 2>/dev/null
+                    
+                    if [ $? -eq 0 ]; then
+                        echo -e "${GREEN}✓ SQL Server数据库恢复成功${NC}"
+                    else
+                        echo -e "${RED}✗ SQL Server数据库恢复失败${NC}"
+                    fi
+                    
+                    # 清理临时文件
+                    [ -f "$temp_file" ] && rm -f "$temp_file"
+                else
+                    echo -e "${RED}未安装SQL Server客户端工具${NC}"
+                fi
+            else
+                echo -e "${RED}备份文件不存在: $restore_file${NC}"
+            fi
+            
+            read -p "按回车键继续..."
+            sqlserver_service_ops
+            ;;
+        10)
+            operation_maintenance
+            return
+            ;;
+        *)
+            echo -e "${RED}无效的选择${NC}"
+            sleep 2
+            sqlserver_service_ops
+            ;;
+    esac
 }
 
 # Docker镜像源切换功能
@@ -4693,7 +8081,14 @@ docker_mirror_switch() {
     case $mirror_choice in
         1)
             # 阿里云镜像源
-            configure_docker_mirror "https://<your-id>.mirror.aliyuncs.com" "阿里云"
+            read -p "请输入阿里云镜像加速器ID: " aliyun_id
+            if [ -n "$aliyun_id" ]; then
+                configure_docker_mirror "https://${aliyun_id}.mirror.aliyuncs.com" "阿里云"
+            else
+                echo -e "${RED}未输入ID，已取消${NC}"
+                read -p "按回车键返回镜像源菜单..."
+                docker_mirror_switch
+            fi
             ;;
         2)
             # 腾讯云镜像源
@@ -4701,7 +8096,14 @@ docker_mirror_switch() {
             ;;
         3)
             # 华为云镜像源
-            configure_docker_mirror "https://<your-id>.swr.myhuaweicloud.com" "华为云"
+            read -p "请输入华为云镜像加速器ID: " huawei_id
+            if [ -n "$huawei_id" ]; then
+                configure_docker_mirror "https://${huawei_id}.swr.myhuaweicloud.com" "华为云"
+            else
+                echo -e "${RED}未输入ID，已取消${NC}"
+                read -p "按回车键返回镜像源菜单..."
+                docker_mirror_switch
+            fi
             ;;
         4)
             # 网易云镜像源
@@ -4748,34 +8150,18 @@ configure_docker_mirror() {
     
     echo -e "${CYAN}正在配置${mirror_name}镜像源...${NC}"
     
-    # 创建daemon.json文件
-    local daemon_config="{}"
-    
-    if [ -f /etc/docker/daemon.json ]; then
-        daemon_config=$(cat /etc/docker/daemon.json)
-    fi
-    
-    # 更新配置
     if [ -z "$mirror_url" ]; then
-        # 使用官方源，移除registry-mirrors配置
-        echo "{}" > /etc/docker/daemon.json
-        echo -e "${GREEN}已配置为Docker官方源${NC}"
+        if update_docker_daemon_json ""; then
+            echo -e "${GREEN}已配置为Docker官方源${NC}"
+        else
+            echo -e "${RED}Docker官方源配置失败${NC}"
+        fi
     else
-        # 配置镜像源
-        cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": ["$mirror_url"],
-  "insecure-registries": [],
-  "debug": false,
-  "experimental": false,
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
-}
-EOF
-        echo -e "${GREEN}已配置${mirror_name}镜像源: $mirror_url${NC}"
+        if update_docker_daemon_json "$mirror_url"; then
+            echo -e "${GREEN}已配置${mirror_name}镜像源: $mirror_url${NC}"
+        else
+            echo -e "${RED}${mirror_name}镜像源配置失败${NC}"
+        fi
     fi
     
     # 重启Docker服务
@@ -4843,10 +8229,19 @@ test_mirror_speed() {
         docker pull "$image" > /dev/null 2>&1
         local end_time=$(date +%s.%N)
         
-        local elapsed_time=$(echo "$end_time - $start_time" | bc)
+        local elapsed_time=""
+        if command_exists bc; then
+            elapsed_time=$(echo "$end_time - $start_time" | bc)
+        else
+            elapsed_time=$(printf "%.2f" "$(awk "BEGIN {print $end_time - $start_time}")" 2>/dev/null)
+        fi
         
         if [ $? -eq 0 ]; then
-            echo -e "  ${GREEN}✓ 成功: ${elapsed_time}秒${NC}"
+            if [ -n "$elapsed_time" ]; then
+                echo -e "  ${GREEN}✓ 成功: ${elapsed_time}秒${NC}"
+            else
+                echo -e "  ${GREEN}✓ 成功${NC}"
+            fi
             
             # 清理镜像
             docker rmi "$image" > /dev/null 2>&1
