@@ -587,10 +587,10 @@ PY
             
             # 检查间隔
             sleep 60
-        else:
+        else
             sleep 60
         fi
-    else:
+    else
         sleep 60
     fi
     done

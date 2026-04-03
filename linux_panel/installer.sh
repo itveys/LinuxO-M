@@ -41,6 +41,8 @@ source "$(dirname "$0")/modules/compatibility.sh"
 source "$(dirname "$0")/modules/monitor.sh"
 source "$(dirname "$0")/modules/panel.sh"
 source "$(dirname "$0")/modules/docker.sh"
+source "$(dirname "$0")/modules/daemon.sh"
+source "$(dirname "$0")/modules/database.sh"
 
 # 主菜单
 main_menu() {
@@ -62,12 +64,14 @@ main_menu() {
         echo -e "${GREEN}4.${NC} 服务器管理"
         echo -e "${GREEN}5.${NC} 运维工具"
         echo -e "${GREEN}6.${NC} Docker功能"
+        echo -e "${GREEN}7.${NC} 项目守护"
+        echo -e "${GREEN}8.${NC} 数据库管理"
         echo -e "${GREEN}0.${NC} 退出脚本"
         echo ""
         echo -e "${YELLOW}========================================${NC}"
         echo ""
         
-        read -p "请选择功能 (0-6): " main_choice
+        read -p "请选择功能 (0-8): " main_choice
         
         case $main_choice in
             1)
@@ -87,6 +91,12 @@ main_menu() {
                 ;;
             6)
                 install_docker
+                ;;
+            7)
+                project_daemon_menu
+                ;;
+            8)
+                database_menu
                 ;;
             0)
                 echo -e "${GREEN}脚本执行完成，感谢使用！${NC}"

@@ -360,24 +360,24 @@ if os.path.exists(config_file):
         # 根据数据库类型执行不同的检测
         if type == 'mysql':
             # 连接测试
-            print("1. 连接测试...")
+            print('1. 连接测试...')
             cmd = f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SELECT 1;' 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("   ✓ 连接成功")
+                print('   ✓ 连接成功')
             else:
                 print(f"   ✗ 连接失败: {result.stderr}")
             
             # 状态检测
-            print("2. 状态检测...")
+            print('2. 状态检测...')
             cmd = f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS;' 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("   ✓ 状态获取成功")
+                print('   ✓ 状态获取成功')
                 # 提取关键指标
-                uptime = subprocess.run(f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS LIKE "Uptime";' 2>&1", shell=True, capture_output=True, text=True).stdout
-                connections = subprocess.run(f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS LIKE "Connections";' 2>&1", shell=True, capture_output=True, text=True).stdout
-                slow_queries = subprocess.run(f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS LIKE "Slow_queries";' 2>&1", shell=True, capture_output=True, text=True).stdout
+                uptime = subprocess.run(f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS LIKE \"Uptime\";' 2>&1", shell=True, capture_output=True, text=True).stdout
+                connections = subprocess.run(f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS LIKE \"Connections\";' 2>&1", shell=True, capture_output=True, text=True).stdout
+                slow_queries = subprocess.run(f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW GLOBAL STATUS LIKE \"Slow_queries\";' 2>&1", shell=True, capture_output=True, text=True).stdout
                 print(f"   运行时间: {uptime.strip()}")
                 print(f"   连接数: {connections.strip()}")
                 print(f"   慢查询: {slow_queries.strip()}")
@@ -385,57 +385,57 @@ if os.path.exists(config_file):
                 print(f"   ✗ 状态获取失败: {result.stderr}")
             
             # 性能指标
-            print("3. 性能指标...")
-            cmd = f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW VARIABLES LIKE "%buffer%";' 2>&1"
+            print('3. 性能指标...')
+            cmd = f"mysql -h {host} -P {port} -u {user} -p{password} -e 'SHOW VARIABLES LIKE \"%buffer%\";' 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("   ✓ 性能指标获取成功")
+                print('   ✓ 性能指标获取成功')
                 print(result.stdout)
             else:
                 print(f"   ✗ 性能指标获取失败: {result.stderr}")
             
         elif type == 'postgresql':
             # 连接测试
-            print("1. 连接测试...")
+            print('1. 连接测试...')
             cmd = f"PGPASSWORD={password} psql -h {host} -p {port} -U {user} -c 'SELECT 1;' 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("   ✓ 连接成功")
+                print('   ✓ 连接成功')
             else:
                 print(f"   ✗ 连接失败: {result.stderr}")
             
             # 状态检测
-            print("2. 状态检测...")
+            print('2. 状态检测...')
             cmd = f"PGPASSWORD={password} psql -h {host} -p {port} -U {user} -c 'SELECT * FROM pg_stat_database;' 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("   ✓ 状态获取成功")
+                print('   ✓ 状态获取成功')
                 print(result.stdout)
             else:
                 print(f"   ✗ 状态获取失败: {result.stderr}")
             
         elif type == 'redis':
             # 连接测试
-            print("1. 连接测试...")
+            print('1. 连接测试...')
             if password:
                 cmd = f"redis-cli -h {host} -p {port} -a {password} ping 2>&1"
             else:
                 cmd = f"redis-cli -h {host} -p {port} ping 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0 and 'PONG' in result.stdout:
-                print("   ✓ 连接成功")
+                print('   ✓ 连接成功')
             else:
                 print(f"   ✗ 连接失败: {result.stderr}")
             
             # 状态检测
-            print("2. 状态检测...")
+            print('2. 状态检测...')
             if password:
                 cmd = f"redis-cli -h {host} -p {port} -a {password} info 2>&1"
             else:
                 cmd = f"redis-cli -h {host} -p {port} info 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("   ✓ 状态获取成功")
+                print('   ✓ 状态获取成功')
                 # 提取关键指标
                 uptime = subprocess.run(cmd + " | grep uptime_in_seconds", shell=True, capture_output=True, text=True).stdout
                 connected_clients = subprocess.run(cmd + " | grep connected_clients", shell=True, capture_output=True, text=True).stdout
@@ -513,11 +513,11 @@ if os.path.exists(config_file):
             cmd = f"mysqldump -h {host} -P {port} -u {user} -p{password} --all-databases > {backup_file} 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("✓ MySQL备份成功")
+                print('✓ MySQL备份成功')
                 # 压缩备份文件
                 gzip_cmd = f"gzip {backup_file} 2>&1"
                 subprocess.run(gzip_cmd, shell=True)
-                print("✓ 备份文件已压缩")
+                print('✓ 备份文件已压缩')
             else:
                 print(f"✗ MySQL备份失败: {result.stderr}")
             
@@ -526,11 +526,11 @@ if os.path.exists(config_file):
             cmd = f"PGPASSWORD={password} pg_dumpall -h {host} -p {port} -U {user} > {backup_file} 2>&1"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             if result.returncode == 0:
-                print("✓ PostgreSQL备份成功")
+                print('✓ PostgreSQL备份成功')
                 # 压缩备份文件
                 gzip_cmd = f"gzip {backup_file} 2>&1"
                 subprocess.run(gzip_cmd, shell=True)
-                print("✓ 备份文件已压缩")
+                print('✓ 备份文件已压缩')
             else:
                 print(f"✗ PostgreSQL备份失败: {result.stderr}")
             
@@ -544,8 +544,8 @@ if os.path.exists(config_file):
             if result.returncode == 0:
                 # 复制RDB文件
                 # 注意：需要知道Redis的持久化目录
-                print("✓ Redis备份命令执行成功")
-                print("提示: Redis已执行SAVE命令，RDB文件已更新")
+                print('✓ Redis备份命令执行成功')
+                print('提示: Redis已执行SAVE命令，RDB文件已更新')
             else:
                 print(f"✗ Redis备份失败: {result.stderr}")
         else:
