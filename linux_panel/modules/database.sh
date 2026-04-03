@@ -617,6 +617,7 @@ PY
             show_success "备份计划配置成功"
         else:
             show_error "需要Python 3来修改配置文件"
+        fi
     else:
         if command_exists python3; then
             python3 - << 'PY'
@@ -646,6 +647,7 @@ PY
             show_success "备份计划已禁用"
         else:
             show_error "需要Python 3来修改配置文件"
+        fi
     fi
     
     pause

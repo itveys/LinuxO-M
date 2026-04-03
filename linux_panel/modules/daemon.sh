@@ -371,6 +371,7 @@ PY
             show_success "钉钉推送配置成功"
         else:
             show_error "需要Python 3来修改配置文件"
+        fi
     else:
         if command_exists python3; then
             python3 - << 'PY'
@@ -401,6 +402,7 @@ PY
             show_success "钉钉推送已禁用"
         else:
             show_error "需要Python 3来修改配置文件"
+        fi
     fi
     
     pause
@@ -470,6 +472,7 @@ else:
 PY
     else:
         show_error "需要Python 3来发送钉钉消息"
+    fi
 }
 
 # 检查项目状态
