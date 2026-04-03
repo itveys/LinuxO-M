@@ -1,0 +1,10 @@
+[Unit]
+Description=Baidu Tieba Automatic Signin Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/workspace/automatic_tieba_signin.sh
+
+[Install]
+WantedBy=multi-user.target
